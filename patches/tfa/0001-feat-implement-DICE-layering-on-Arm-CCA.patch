@@ -1,0 +1,1399 @@
+From e7d5edbb659e9e8eef2f6ff6fcc5b0c0e94e918d Mon Sep 17 00:00:00 2001
+From: Antonio Di Ponzio <antoniodiponzio@protonmail.com>
+Date: Thu, 23 Jul 2026 12:12:55 +0200
+Subject: [PATCH 1/3] feat: implement DICE layering on Arm CCA
+
+---
+ Makefile                                      |   9 +
+ bl2/bl2_image_load_v2.c                       |  14 +
+ drivers/auth/crypto_mod.c                     | 101 ++++++
+ drivers/auth/mbedtls/mbedtls_common.mk        |  20 ++
+ drivers/auth/mbedtls/mbedtls_psa_crypto.c     | 297 +++++++++++++++++-
+ drivers/dice_layering/dice_layering.c         | 193 ++++++++++++
+ drivers/dice_layering/dice_layering.mk        |  28 ++
+ .../dice_layering/dice_layering_hardcoded.c   |  88 ++++++
+ include/drivers/auth/crypto_mod.h             |  57 +++-
+ .../auth/mbedtls/default_mbedtls_config.h     |  53 +++-
+ include/drivers/dice_layering/dice_layering.h |  43 +++
+ .../dice_layering/dice_layering_hardcoded.h   |  12 +
+ plat/qemu/common/qemu_common.c                | 166 +++++++++-
+ plat/qemu/qemu_sbsa/include/platform_def.h    |   6 +-
+ plat/qemu/qemu_sbsa/platform.mk               |  15 +
+ services/std_svc/rmmd/rmmd_main.c             |   8 +
+ 16 files changed, 1102 insertions(+), 8 deletions(-)
+ create mode 100644 drivers/dice_layering/dice_layering.c
+ create mode 100644 drivers/dice_layering/dice_layering.mk
+ create mode 100644 drivers/dice_layering/dice_layering_hardcoded.c
+ create mode 100644 include/drivers/dice_layering/dice_layering.h
+ create mode 100644 include/drivers/dice_layering/dice_layering_hardcoded.h
+
+diff --git a/Makefile b/Makefile
+index 530e6e0f5..85cbc61dc 100644
+--- a/Makefile
++++ b/Makefile
+@@ -914,6 +914,13 @@ else
+ 	CRYPTO_SUPPORT := 0
+ endif #($(MEASURED_BOOT)-$(TRUSTED_BOARD_BOOT))
+ 
++# Hash calculation is needed to compute the RMM TCI
++ifeq ($(DICE_LAYERING),1)
++	#$(info Dice layering enabled)
++	CRYPTO_SUPPORT := 2
++
++endif #($(DICE_LAYERING),1)
++
+ ifneq ($(filter 1 2 3,$(CRYPTO_SUPPORT)),)
+ CRYPTO_LIB := $(BUILD_PLAT)/lib/libmbedtls.a
+ endif
+@@ -1336,6 +1343,7 @@ $(eval $(call assert_booleans,\
+ 	EARLY_CONSOLE \
+ 	PRESERVE_DSU_PMU_REGS \
+ 	HOB_LIST \
++	DICE_LAYERING \
+ )))
+ 
+ # Numeric_Flags
+@@ -1565,6 +1573,7 @@ $(eval $(call add_defines,\
+ 	EARLY_CONSOLE \
+ 	PRESERVE_DSU_PMU_REGS \
+ 	HOB_LIST \
++	DICE_LAYERING \
+ )))
+ 
+ ifeq (${PLATFORM_REPORT_CTX_MEM_USE}, 1)
+diff --git a/bl2/bl2_image_load_v2.c b/bl2/bl2_image_load_v2.c
+index dee3fc2d3..4d8d255b0 100644
+--- a/bl2/bl2_image_load_v2.c
++++ b/bl2/bl2_image_load_v2.c
+@@ -18,6 +18,10 @@
+ 
+ #include <platform_def.h>
+ 
++#ifdef DICE_LAYERING
++#include <drivers/dice_layering/dice_layering.h>
++#endif
++
+ /*******************************************************************************
+  * This function loads SCP_BL2/BL3x images and returns the ep_info for
+  * the next executable image.
+@@ -73,6 +77,16 @@ struct entry_point_info *bl2_load_images(void)
+ 				      bl2_node_info->image_id, err);
+ 				plat_error_handler(err);
+ 			}
++#ifdef DICE_LAYERING
++			/*
++			 * If the current loaded image is the RMM, measure the TCI.
++			 */
++			if (bl2_node_info->image_id == RMM_IMAGE_ID) {
++				dice_layering_measure_image(bl2_node_info->image_id,
++							    bl2_node_info->image_info);
++				save_tci_in_shared_ram();
++			}
++#endif /* DICE_LAYERING */
+ 		} else {
+ 			INFO("BL2: Skip loading image id %u\n", bl2_node_info->image_id);
+ 		}
+diff --git a/drivers/auth/crypto_mod.c b/drivers/auth/crypto_mod.c
+index 882ca8efa..9b0dd8682 100644
+--- a/drivers/auth/crypto_mod.c
++++ b/drivers/auth/crypto_mod.c
+@@ -188,6 +188,107 @@ int crypto_mod_auth_decrypt(enum crypto_dec_algo dec_algo, void *data_ptr,
+ 					    tag_len);
+ }
+ 
++#if defined(DICE_LAYERING) && defined(IMAGE_BL31)
++
++/*
++ * Derive a seed through an HKDF algorithm.
++ *
++ * Parameters:
++ *
++ *   input, input_len: input to the HKDF
++ *   output, output_len: output of the HKDF
++ */
++int crypto_mod_derive_seed(const void *input, size_t input_len,
++			   void *output, size_t output_len)
++{
++	assert(crypto_lib_desc.derive_seed != NULL);
++	assert(input != NULL);
++	assert(input_len != 0);
++	assert(output != NULL);
++	assert(output_len != 0);
++
++	return crypto_lib_desc.derive_seed(input, input_len, output, output_len);
++}
++/*
++ * Derive a keypair deterministically from a seed.
++ *
++ * Parameters:
++ *
++ *   seed, seed_len: seed for key derivation
++ *   out, out_len: export buffer for the generated public key
++ *   key_id: generated keypair identifier
++ */
++int crypto_mod_derive_keypair_deterministic(void *seed, size_t seed_len,
++					    //void *out, size_t *out_len,
++					    uint32_t *key_id)
++{
++	assert(crypto_lib_desc.derive_keypair_deterministic != NULL);
++	assert(seed != NULL);
++	assert(seed_len != 0);
++	//assert(out != NULL);
++	//assert(out_len != NULL);
++	assert(key_id != NULL);
++
++	//return crypto_lib_desc.derive_keypair_deterministic(seed, seed_len, out,
++	//						    out_len, key_id);
++	return crypto_lib_desc.derive_keypair_deterministic(seed, seed_len,
++							    key_id);
++}
++/*
++ * Generate a certificate and export it in DER encoding.
++ *
++ * Parameters:
++ *
++ *   subject_key_id: id of the subject key
++ *   issuer_key_id: id of the issuer key
++ *   subject_name: name of the subject to put in the
++ *                 certificate
++ *   issuer_name: name of the issuer to put in the
++ *                certificate
++ *   out_der: buffer to output the certificate
++ *   max_out_size: out_der buffer size
++ *   cert_len: actual certificate length
++ */
++int crypto_mod_generate_dice_certificate(uint32_t subject_key_id,
++					 uint32_t issuer_key_id,
++					 const char *subject_name,
++					 const char *issuer_name,
++					 uint8_t *out_der, size_t max_out_size,
++					 size_t *cert_len)
++{
++	assert(crypto_lib_desc.generate_dice_certificate != NULL);
++	assert(subject_key_id != 0);
++	assert(issuer_key_id != 0);
++	assert(subject_name != NULL);
++	assert(issuer_name != NULL);
++	assert(out_der != NULL);
++	assert(max_out_size != 0);
++	assert(cert_len != NULL);
++
++	return crypto_lib_desc.generate_dice_certificate(subject_key_id, issuer_key_id,
++							 subject_name, issuer_name,
++							 out_der, max_out_size,
++							 cert_len);
++}
++/*
++ * Import a keypair inside the vault from an array.
++ *
++ * Parameters:
++ *   - key, key_len: input key buffer
++ *   - key_id: identifier for the imported key
++ *	       in the vault
++ */
++int crypto_mod_import_keypair(uint8_t *key, size_t key_len,
++			      uint32_t *key_id)
++{
++	assert(crypto_lib_desc.import_keypair != NULL);
++	assert(key != NULL);
++	assert(key_len != 0);
++	assert(key_id != NULL);
++
++	return crypto_lib_desc.import_keypair(key, key_len, key_id);
++}
++#endif /* defined(DICE_LAYERING) && defined(IMAGE_BL31) */
+ /* Perform end of psa crypto usage calls to finish */
+ void crypto_mod_finish(void)
+ {
+diff --git a/drivers/auth/mbedtls/mbedtls_common.mk b/drivers/auth/mbedtls/mbedtls_common.mk
+index b3c4c9188..bc1c98ff3 100644
+--- a/drivers/auth/mbedtls/mbedtls_common.mk
++++ b/drivers/auth/mbedtls/mbedtls_common.mk
+@@ -77,6 +77,26 @@ LIBMBEDTLS_SRCS         += $(addprefix ${MBEDTLS_DIR}/library/,    	\
+ 					psa_crypto_cipher.c             \
+ 					psa_util.c			\
+ 					)
++ifeq (${DICE_LAYERING},1)
++
++LIBMBEDTLS_SRCS        += $(addprefix ${MBEDTLS_DIR}/library/,    	\
++   					x509write_crt.c \
++					x509_create.c \
++					pkwrite.c \
++					psa_crypto_mac.c \
++					psa_crypto_ecp.c \
++					psa_crypto_driver_wrappers_no_static.c \
++					hkdf.c \
++					pk_wrap.c \
++					pk.c \
++					ecp.c \
++					ecdsa.c \
++        				ecp_curves.c \
++        				psa_util.c \
++					oid.c \
++					hmac_drbg.c \
++					)
++endif
+ endif
+ 
+ # The platform may define the variable 'TF_MBEDTLS_KEY_ALG' to select the key
+diff --git a/drivers/auth/mbedtls/mbedtls_psa_crypto.c b/drivers/auth/mbedtls/mbedtls_psa_crypto.c
+index 34987e4f0..9b815b8d7 100644
+--- a/drivers/auth/mbedtls/mbedtls_psa_crypto.c
++++ b/drivers/auth/mbedtls/mbedtls_psa_crypto.c
+@@ -27,6 +27,10 @@
+ #include <drivers/auth/mbedtls/mbedtls_psa_crypto.h>
+ #include <plat/common/platform.h>
+ 
++#ifdef DICE_LAYERING
++#include <mbedtls/x509_crt.h>
++#endif
++
+ #define LIB_NAME		"mbed TLS PSA"
+ 
+ /* Minimum required size for a buffer containing a raw EC signature when using
+@@ -72,6 +76,36 @@ CASSERT(CRYPTO_MD_MAX_SIZE >= MBEDTLS_MD_MAX_SIZE,
+  * }
+  */
+ 
++#if defined(DICE_LAYERING) && defined(IMAGE_BL31)
++/*
++ * For the cryptographic operations, in tf-a code there is no need for
++ * rng since all the used algorithms are deterministic (Deterministic ECDSA
++ * and HKDF). This function is still needed for the side-channel attack
++ * protection enforced in the CRT signing function.
++ *
++ * This workaround let the code to be compiled. Since the side-channel
++ * protection is out of the threat model, it is ok implementing this solution.
++ */
++psa_status_t mbedtls_psa_external_get_random(
++			mbedtls_psa_external_random_context_t *context,
++			uint8_t *output, size_t output_size,
++			size_t *output_length)
++{
++	(void)context; /* Unused */
++
++	/* For QEMU DICE prototyping, bypass the missing hardware TRNG
++	 * and provide dummy entropy for Elliptic Curve blinding.
++	 *
++	 * NOTE: side-channel protection functionalities are not guaranteed.
++	 */
++	if (output != NULL && output_size > 0) {
++		memset(output, 0xAA, output_size);
++	}
++
++	*output_length = output_size;
++	return PSA_SUCCESS; /* 0 means success in PSA Crypto! */
++}
++#else
+ /*
+  * We pretend using an external RNG (through MBEDTLS_PSA_CRYPTO_EXTERNAL_RNG
+  * mbedTLS config option) so we need to provide an implementation of
+@@ -86,7 +120,7 @@ psa_status_t mbedtls_psa_external_get_random(
+ {
+ 	return PSA_ERROR_INSUFFICIENT_ENTROPY;
+ }
+-
++#endif
+ /*
+  * Initialize the library and export the descriptor
+  */
+@@ -584,6 +618,259 @@ static int auth_decrypt(enum crypto_dec_algo dec_algo, void *data_ptr,
+ }
+ #endif /* TF_MBEDTLS_USE_AES_GCM */
+ 
++#if defined(DICE_LAYERING) && defined(IMAGE_BL31)
++/*
++ * This function will not be actually called but it is needed for old mbedtls
++ * API compliancy.
++ */
++static int dummy_rng_wrapper(void *ctx, unsigned char *buf, size_t len)
++{
++	assert(false);
++	(void)ctx;
++	if (buf != NULL && len > 0) {
++	    /* Fill with zeros to avoid uninitialized memory access just in case */
++	    memset(buf, 0, len);
++	}
++
++	return CRYPTO_SUCCESS;
++}
++
++/*
++ * Derive a value through HKDF using SHA256.
++ *
++ * Note that the caller must ensure that the output buffer is at least
++ * output_len long.
++ */
++static int derive_seed(const void* input, size_t input_len,
++		       void* output, size_t output_len)
++{
++	psa_status_t status;
++	psa_key_derivation_operation_t deriv_op = PSA_KEY_DERIVATION_OPERATION_INIT;
++
++	status = psa_key_derivation_setup(&deriv_op, PSA_ALG_HKDF(PSA_ALG_SHA_256));
++	if (status != PSA_SUCCESS)
++		return status;
++
++	/*
++	 * Provide NULL salt and info since they are not needed.
++	 */
++	status = psa_key_derivation_input_bytes(&deriv_op, PSA_KEY_DERIVATION_INPUT_SALT,
++						NULL, 0);
++	if (status != PSA_SUCCESS) goto end;
++
++	status = psa_key_derivation_input_bytes(&deriv_op, PSA_KEY_DERIVATION_INPUT_SECRET,
++						input, input_len);
++	if (status != PSA_SUCCESS) goto end;
++
++	status = psa_key_derivation_input_bytes(&deriv_op, PSA_KEY_DERIVATION_INPUT_INFO,
++						NULL, 0);
++	if (status != PSA_SUCCESS) goto end;
++
++	status = psa_key_derivation_output_bytes(&deriv_op, output, output_len);
++end:
++	psa_key_derivation_abort(&deriv_op);
++	return status;
++}
++/*
++ * Derive a keypair deterministically from a given seed.
++ *
++ * The function exports the public key of the key pair since
++ * it is needed for the certificate generation.
++ */
++static int derive_keypair_deterministic(void* seed, size_t seed_len,
++					psa_key_id_t* key_id)
++{
++	/*
++	 * 1. Import the seed in the vault
++	 */
++	psa_status_t status = PSA_ERROR_CORRUPTION_DETECTED;
++	psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
++	psa_key_derivation_operation_t deriv_op = PSA_KEY_DERIVATION_OPERATION_INIT;
++
++	psa_key_id_t seed_id = PSA_KEY_ID_NULL;
++
++	psa_set_key_type(&attributes, PSA_KEY_TYPE_DERIVE);
++	psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_DERIVE);
++	psa_set_key_algorithm(&attributes, PSA_ALG_HKDF(PSA_ALG_SHA_256));
++
++	status = psa_import_key(&attributes, seed, seed_len, &seed_id);
++	if (status != PSA_SUCCESS) return status;
++
++	/*
++	 * 2. Derive the keypair
++	 */
++	attributes = psa_key_attributes_init();
++
++	status = psa_key_derivation_setup(&deriv_op,
++					  PSA_ALG_HKDF(PSA_ALG_SHA_256));
++	if (status != PSA_SUCCESS) goto end;
++
++	/*
++	 * Provide NULL salt and info since they are not needed
++	 */
++	status = psa_key_derivation_input_bytes(&deriv_op,
++						PSA_KEY_DERIVATION_INPUT_SALT,
++						NULL, 0);
++	if (status != PSA_SUCCESS) goto end;
++
++	status = psa_key_derivation_input_key(&deriv_op,
++					      PSA_KEY_DERIVATION_INPUT_SECRET,
++					      seed_id);
++	if (status != PSA_SUCCESS) goto end;
++
++	status = psa_key_derivation_input_bytes(&deriv_op,
++						PSA_KEY_DERIVATION_INPUT_INFO,
++						NULL, 0);
++	if (status != PSA_SUCCESS) goto end;
++
++	/* Set the curve and the key dimension */
++	psa_set_key_type(&attributes,
++			 PSA_KEY_TYPE_ECC_KEY_PAIR(PSA_ECC_FAMILY_SECP_R1));
++
++	psa_set_key_bits(&attributes, 256);
++
++	/* Set key permissions */
++	psa_set_key_usage_flags(&attributes,
++				PSA_KEY_USAGE_SIGN_HASH | PSA_KEY_USAGE_EXPORT);
++	psa_set_key_algorithm(&attributes,
++			      PSA_ALG_DETERMINISTIC_ECDSA(PSA_ALG_SHA_256));
++
++	/* Generate the key */
++	status = psa_key_derivation_output_key(&attributes, &deriv_op, key_id);
++end:
++	psa_key_derivation_abort(&deriv_op);
++	psa_destroy_key(seed_id);
++
++	return status;
++}
++
++static int generate_dice_certificate(psa_key_id_t subject_key_id,
++				     psa_key_id_t issuer_key_id,
++				     const char *subject_name,
++				     const char *issuer_name,
++				     uint8_t *out_der, size_t max_out_size,
++				     size_t *cert_len)
++{
++	int ret;
++	mbedtls_pk_context subject_pk;
++	mbedtls_pk_context issuer_pk;
++	mbedtls_x509write_cert crt;
++	mbedtls_mpi serial;
++
++	/* Standard RNG context needed by the X.509 module for internal formatting */
++	//mbedtls_ctr_drbg_context ctr_drbg;
++	//mbedtls_entropy_context entropy;
++
++	mbedtls_pk_init(&subject_pk);
++	mbedtls_pk_init(&issuer_pk);
++	mbedtls_x509write_crt_init(&crt);
++	mbedtls_mpi_init(&serial);
++	//mbedtls_ctr_drbg_init(&ctr_drbg);
++	//mbedtls_entropy_init(&entropy);
++
++	/* Seed the RNG (X.509 needs this, even though PSA handles the actual signing RNG) */
++	//ret = mbedtls_ctr_drbg_seed(&ctr_drbg, mbedtls_entropy_func, &entropy,
++	//                            (const unsigned char *)"DICE_CERT_AAA", 13);
++	//if (ret != 0) goto cleanup;
++
++	/* Wrap subject key in pk context */
++	ret = mbedtls_pk_setup_opaque(&subject_pk, subject_key_id);
++	if (ret != 0) {
++		goto cleanup;
++	}
++
++	ret = mbedtls_pk_setup_opaque(&issuer_pk, issuer_key_id);
++	if (ret != 0) {
++		goto cleanup;
++	}
++
++	mbedtls_x509write_crt_set_version(&crt, MBEDTLS_X509_CRT_VERSION_3);
++	mbedtls_x509write_crt_set_md_alg(&crt, MBEDTLS_MD_SHA256);
++
++	mbedtls_x509write_crt_set_subject_key(&crt, &subject_pk);
++	mbedtls_x509write_crt_set_issuer_key(&crt, &issuer_pk);
++
++
++	/* Set standard Distinguished Names (DN) */
++	ret = mbedtls_x509write_crt_set_subject_name(&crt, subject_name);
++	if (ret != 0) goto cleanup;
++
++	ret = mbedtls_x509write_crt_set_issuer_name(&crt, issuer_name);
++	if (ret != 0) goto cleanup;
++
++	/* Set general values according to RFC5280 */
++	ret = mbedtls_x509write_crt_set_validity(&crt, "19700101000000",
++						 "99991231235959");
++	if (ret != 0) goto cleanup;
++
++	mbedtls_mpi_lset(&serial, 1);
++	ret = mbedtls_x509write_crt_set_serial(&crt, &serial);
++	if (ret != 0) goto cleanup;
++
++	/* Constraints:
++	 *	- is_ca = 1
++	 *	- max_path_len = 1
++	 */
++	ret = mbedtls_x509write_crt_set_basic_constraints(&crt, 1, 1);
++	if (ret != 0) goto cleanup;
++
++	ret = mbedtls_x509write_crt_set_key_usage(&crt, MBEDTLS_X509_KU_KEY_CERT_SIGN);
++	if (ret != 0) goto cleanup;
++
++	/* clean the memory for the certificate */
++	memset(out_der, 0, max_out_size);
++
++	ret = mbedtls_x509write_crt_der(&crt, out_der, max_out_size,
++	                                dummy_rng_wrapper, NULL);
++	if (ret > 0) {
++		*cert_len = ret;
++		/*
++		 * Since the function writes the certificate at the end
++		 * of the buffer, move it to the beginning.
++		 */
++		memmove(out_der, out_der + max_out_size - ret, ret);
++		ret = 0;
++	} else {
++		/*
++		 * ret = 0 indicates a failure in the mbedtls_x509write_crt_der
++		 * function. So, set the variable to any value different
++		 * from 0 to ensure a proper return code.
++		 */
++		ret = -1;
++	}
++
++cleanup:
++	/* Free all memory buffers to prevent leaks */
++	mbedtls_pk_free(&subject_pk);
++	mbedtls_pk_free(&issuer_pk);
++	mbedtls_x509write_crt_free(&crt);
++	mbedtls_mpi_free(&serial);
++
++	return (ret == 0) ? PSA_SUCCESS : PSA_ERROR_GENERIC_ERROR;
++}
++/*
++ * Import a keypair.
++ *
++ * Note that only the private key is needed since the public one
++ * is automatically derived by PSA.
++ */
++static int import_keypair(uint8_t *key, size_t key_len,
++			  psa_key_id_t *key_id)
++{
++	psa_status_t status;
++	psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
++
++	psa_set_key_type(&attributes, PSA_KEY_TYPE_ECC_KEY_PAIR(PSA_ECC_FAMILY_SECP_R1));
++	psa_set_key_bits(&attributes, 256);
++	psa_set_key_usage_flags(&attributes,
++				PSA_KEY_USAGE_SIGN_HASH | PSA_KEY_USAGE_EXPORT);
++	psa_set_key_algorithm(&attributes, PSA_ALG_DETERMINISTIC_ECDSA(PSA_ALG_SHA_256));
++
++	status = psa_import_key(&attributes, key, key_len, key_id);
++
++	return status;
++}
++#endif /*defined(DICE_LAYERING) && defined(IMAGE_BL31)*/
+ /*
+  * Register crypto library descriptor
+  */
+@@ -604,5 +891,13 @@ REGISTER_CRYPTO_LIB(LIB_NAME, init, verify_signature, verify_hash, NULL,
+ 		    NULL, NULL, finish);
+ #endif
+ #elif CRYPTO_SUPPORT == CRYPTO_HASH_CALC_ONLY
++
++#if defined(DICE_LAYERING) && defined(IMAGE_BL31)
++REGISTER_CRYPTO_LIB(LIB_NAME, init, NULL, NULL, calc_hash, NULL, NULL,
++		    derive_seed, derive_keypair_deterministic,
++		    generate_dice_certificate, import_keypair, finish);
++#else
+ REGISTER_CRYPTO_LIB(LIB_NAME, init, NULL, NULL, calc_hash, NULL, NULL, finish);
++#endif /* defined(DICE_LAYERING) && defined(IMAGE_BL31) */
++
+ #endif /* CRYPTO_SUPPORT == CRYPTO_AUTH_VERIFY_AND_HASH_CALC */
+diff --git a/drivers/dice_layering/dice_layering.c b/drivers/dice_layering/dice_layering.c
+new file mode 100644
+index 000000000..234f8ae1f
+--- /dev/null
++++ b/drivers/dice_layering/dice_layering.c
+@@ -0,0 +1,193 @@
++#include <drivers/dice_layering/dice_layering.h>
++#include <drivers/dice_layering/dice_layering_hardcoded.h>
++#include <assert.h>
++#include <platform_def.h>
++
++#include <common/debug.h>
++#include <drivers/auth/crypto_mod.h>
++
++/*
++ * Since the amount of busy memory in the shared ram can vary depending
++ * on several factors, write the value in the last 64 bytes.
++ */
++#define TCI_RMM_ADDRESS (SHARED_RAM_BASE + SHARED_RAM_SIZE - CRYPTO_MD_MAX_SIZE)
++
++static uint8_t tci_rmm[CRYPTO_MD_MAX_SIZE];
++static size_t tci_rmm_len = 0;
++
++#ifdef IMAGE_BL31
++uint8_t cdi_rmm[CDI_LEN];
++size_t cdi_rmm_len = 0;
++
++uint8_t rmm_cert[CERT_MAX_LEN];
++size_t rmm_cert_len = CERT_MAX_LEN;
++
++uint8_t tfa_cert[CERT_MAX_LEN];
++size_t tfa_cert_len = 0;
++#endif /* IMAGE_BL31 */
++
++int dice_layering_measure_image(unsigned int image_id, image_info_t *image_data)
++{
++	int rc = 0;
++
++	INFO("MEASURE RMM TCI\n");
++	/* Calculate hash */
++	rc = crypto_mod_calc_hash(CRYPTO_MD_SHA256, (void*)image_data->image_base,
++				  image_data->image_size, (unsigned char*)tci_rmm);
++
++	return rc;
++}
++
++/*
++ * The TCI(rmm) is passed from BL2 to BL31 through the shared memory area.
++ *
++ * save_tci_in_shared_ram() copies the value from a buffer to the shared
++ * memory.
++ *
++ * read_tci_from_shared_ram() copy the value from the shared
++ * memory to the .bss section, where the tci_rmm buffer is defined.
++ *
++ * TODO: consider a zero-copy approach to minimize the memory overhead.
++ */
++void save_tci_in_shared_ram(void)
++{
++	uint8_t *tci_rmm_shared_ram = (uint8_t *)TCI_RMM_ADDRESS;
++
++	memcpy(tci_rmm_shared_ram, tci_rmm, TCI_LEN);
++	INFO("Save RMM TCI in the shared ram at 0x%x\n", TCI_RMM_ADDRESS);
++}
++
++void read_tci_from_shared_ram(void)
++{
++	uint8_t *tci_rmm_shared_ram = (uint8_t *)TCI_RMM_ADDRESS;
++
++	if (sizeof(tci_rmm) >= TCI_LEN) {
++		tci_rmm_len = TCI_LEN;
++		memcpy(tci_rmm, tci_rmm_shared_ram, tci_rmm_len);
++	}
++
++	INFO("Read RMM TCI from the shared ram at 0x%x\n", TCI_RMM_ADDRESS);
++}
++
++#ifdef IMAGE_BL31
++static void dump_hex_buffer(const char *title, const uint8_t *buf, size_t len)
++{
++	INFO("%s (%zu bytes):\n", title, len);
++
++	if (buf == NULL || len == 0) {
++		INFO("  (Empty or NULL buffer)\n");
++		return;
++	}
++
++	for (size_t i = 0; i < len; i += 16) {
++		char line_buf[64] = {0};
++		size_t offset = 0;
++
++		for (size_t j = 0; j < 16 && (i + j) < len; j++) {
++			snprintf(line_buf + offset, sizeof(line_buf) - offset,
++			         "%02X ", buf[i + j]);
++			offset += 3;
++		}
++
++		INFO("  %04X: %s\n", (unsigned int)i, line_buf);
++	}
++}
++
++void dice_layering_prepare_rmm_data(void)
++{
++	/*
++	 * Hardcoded values:
++	 *   - cdi0
++	 *   - tfa secret key
++	 *   - tfa certificate (global variable)
++	 */
++	uint8_t cdi0[CDI_LEN];
++	size_t cdi0_len = 0;
++
++	uint8_t tfa_seck[SEC_KEY_LEN];
++	size_t tfa_seck_len = 0;
++
++	/*
++	 * cdi_rmm_seed will contain CDI(0)||TCI(RMM)
++	 */
++	uint8_t cdi_rmm_seed[SEED_LEN];
++	size_t cdi_rmm_seed_len = 0;
++
++	uint32_t rmm_key_id;
++	uint32_t tfa_key_id;
++
++	int rc;
++
++	crypto_mod_init();
++
++	get_cdi0(cdi0, sizeof(cdi0), &cdi0_len);
++	get_tfa_seck(tfa_seck, sizeof(tfa_seck), &tfa_seck_len);
++	get_tfa_cert(tfa_cert, sizeof(tfa_cert), &tfa_cert_len);
++
++	read_tci_from_shared_ram();
++
++	/*
++	 * Populate the buffer for CDI(RMM) generation seed.
++	 */
++	if (sizeof(cdi_rmm_seed) >= cdi0_len + tci_rmm_len) {
++		memcpy(cdi_rmm_seed, cdi0, cdi0_len);
++		memcpy(cdi_rmm_seed + cdi0_len, tci_rmm, tci_rmm_len);
++		cdi_rmm_seed_len = cdi0_len + tci_rmm_len;
++	}
++
++	/* Feed the vault to generate the CDI value for the RMM */
++	rc = crypto_mod_derive_seed(cdi_rmm_seed, cdi_rmm_seed_len,
++				    cdi_rmm, CDI_LEN);
++	assert(rc == 0);
++	cdi_rmm_len = CDI_LEN;
++	INFO("Derived CDI RMM\n");
++
++	/* Use the CDI value to generate a key pair */
++	rc = crypto_mod_derive_keypair_deterministic(cdi_rmm, cdi_rmm_len,
++						     &rmm_key_id);
++	assert(rc == 0);
++	INFO("Derived RMM key\n");
++
++	/* Import the hardcoded tfa keypair inside the vault */
++	rc = crypto_mod_import_keypair(tfa_seck, tfa_seck_len, &tfa_key_id);
++	assert(rc == 0);
++	INFO("Imported TFA key\n");
++
++	/* Generate the certificate signed with the TFA key */
++	rc = crypto_mod_generate_dice_certificate(rmm_key_id, tfa_key_id,
++						  "CN=RMM,O=CCA_Machine",
++					     	  "CN=TFA,O=CCA_Machine",
++					     	  rmm_cert, sizeof(rmm_cert),
++						  &rmm_cert_len);
++	assert(rc == 0);
++	INFO("Generated RMM cert\n");
++
++	/* Only for debug purposes. */
++	dump_hex_buffer("TCI1", tci_rmm, tci_rmm_len);
++	dump_hex_buffer("CDI RMM", cdi_rmm, cdi_rmm_len);
++	dump_hex_buffer("RMM Cert", rmm_cert, rmm_cert_len);
++
++	/* Once the RMM_CDI have been generated, along with the certificate,
++	 * the other dice values are not needed anymore.
++	 *
++	 * Such buffers must be zero-ed for security reasons.
++	 */
++	memset(cdi0, 0, sizeof(cdi0));
++	memset(tfa_seck, 0, sizeof(tfa_seck));
++	memset(cdi_rmm_seed, 0, sizeof(cdi_rmm_seed));
++
++	crypto_mod_finish();
++}
++
++void zero_global_buffers(void)
++{
++	uint8_t *shared = (uint8_t *)TCI_RMM_ADDRESS;
++
++	/* Clean shared memory for TCI*/
++	memset(shared, 0, CRYPTO_MD_MAX_SIZE);
++	/* Clean global buffer for TCI*/
++	memset(tci_rmm, 0, sizeof(tci_rmm));
++	/* Clean global buffer from CDI RMM*/
++	memset(cdi_rmm, 0, sizeof(cdi_rmm));
++}
++#endif /* IMAGE_BL31 */
+diff --git a/drivers/dice_layering/dice_layering.mk b/drivers/dice_layering/dice_layering.mk
+new file mode 100644
+index 000000000..61e1dd572
+--- /dev/null
++++ b/drivers/dice_layering/dice_layering.mk
+@@ -0,0 +1,28 @@
++DICE_LAYERING ?= 0
++
++ifeq (${DICE_LAYERING},1)
++
++    # Define the source files for your DICE framework
++    DICE_LAYERING_SOURCES	:=	drivers/dice_layering/dice_layering.c
++    DICE_LAYERING_SOURCES	+=	drivers/dice_layering/dice_layering_hardcoded.c
++
++    # If your header is in the global 'include/' directory, TF-A already
++    # knows about it. If you put it in a custom non-standard folder,
++    # uncomment the line below to add it to the include path:
++     INCLUDES			+=	-Iinclude/drivers/dice_layering/
++
++    # Append the sources to the bootloader stages that need them.
++    # DICE typically runs in BL1 (Root of Trust), BL2, and BL31.
++    # If you aren't using DICE in BL1 yet, you can comment that line out.
++    #BL1_SOURCES			+=	${DICE_LAYERING_SOURCES}
++    BL2_SOURCES			+=	${DICE_LAYERING_SOURCES}
++    BL31_SOURCES		+=	${DICE_LAYERING_SOURCES}
++
++    BL31_SOURCES += drivers/auth/crypto_mod.c
++    BL31_SOURCES += drivers/auth/mbedtls/mbedtls_psa_crypto.c
++    BL31_SOURCES += ${MBEDTLS_SOURCES}
++    # Export this flag to the C preprocessor so you can wrap your C code
++    # in #if ENABLE_DICE_LAYERING blocks
++    #$(eval $(call add_define,DICE_LAYERING))
++
++endif
+diff --git a/drivers/dice_layering/dice_layering_hardcoded.c b/drivers/dice_layering/dice_layering_hardcoded.c
+new file mode 100644
+index 000000000..f8ec8e8fd
+--- /dev/null
++++ b/drivers/dice_layering/dice_layering_hardcoded.c
+@@ -0,0 +1,88 @@
++#include <dice_layering_hardcoded.h>
++
++/*
++ * The cdi0 should be calculated from the underlying layer.
++ * Since no HES is available, hardcode it.
++ */
++int get_cdi0(uint8_t *out, size_t out_size, size_t *out_len)
++{
++	uint8_t cdi0[32] = {0x41,0x41,0x41,0x41,0x41,0x41,0x41,0x41,
++			    0x41,0x41,0x41,0x41,0x41,0x41,0x41,0x41,
++			    0x41,0x41,0x41,0x41,0x41,0x41,0x41,0x41,
++			    0x41,0x41,0x41,0x41,0x41,0x41,0x41,0x41};
++
++	if (out_size < 32) return -1;
++
++	*out_len = 32;
++	memcpy(out, cdi0, *out_len);
++	return 0;
++}
++
++int get_tfa_seck(uint8_t *out, size_t out_size, size_t *out_len)
++{
++	uint8_t seck[32] = {0xe3,0x1d,0x56,0x7c,0x68,0x6e,0x7a,0xc6,
++			    0x11,0x80,0x11,0x91,0x4b,0x74,0x79,0xf8,
++			    0x79,0xd1,0xbe,0x8f,0xbd,0xa2,0xc7,0xb4,
++			    0xbe,0xb8,0x90,0xfa,0x4a,0x42,0xc4,0x2d};
++
++	if (out_size < 32) return -1;
++
++	*out_len = 32;
++	memcpy(out, seck, *out_len);
++	return 0;
++}
++
++int get_tfa_cert(uint8_t *out, size_t out_size, size_t *out_len)
++{
++	uint8_t cert[355] = {0x30,0x82,0x01,0x5f,0x30,0x82,0x01,0x05,
++			     0xa0,0x03,0x02,0x01,0x02,0x02,0x01,0x01,
++			     0x30,0x0a,0x06,0x08,0x2a,0x86,0x48,0xce,
++			     0x3d,0x04,0x03,0x02,0x30,0x24,0x31,0x0c,
++			     0x30,0x0a,0x06,0x03,0x55,0x04,0x03,0x0c,
++			     0x03,0x54,0x46,0x41,0x31,0x14,0x30,0x12,
++			     0x06,0x03,0x55,0x04,0x0a,0x0c,0x0b,0x43,
++			     0x43,0x41,0x5f,0x4d,0x61,0x63,0x68,0x69,
++			     0x6e,0x65,0x30,0x20,0x17,0x0d,0x32,0x34,
++			     0x30,0x31,0x30,0x31,0x30,0x30,0x30,0x30,
++			     0x30,0x30,0x5a,0x18,0x0f,0x32,0x30,0x39,
++			     0x39,0x31,0x32,0x33,0x31,0x32,0x33,0x35,
++			     0x39,0x35,0x39,0x5a,0x30,0x24,0x31,0x0c,
++			     0x30,0x0a,0x06,0x03,0x55,0x04,0x03,0x0c,
++			     0x03,0x54,0x46,0x41,0x31,0x14,0x30,0x12,
++			     0x06,0x03,0x55,0x04,0x0a,0x0c,0x0b,0x43,
++			     0x43,0x41,0x5f,0x4d,0x61,0x63,0x68,0x69,
++			     0x6e,0x65,0x30,0x59,0x30,0x13,0x06,0x07,
++			     0x2a,0x86,0x48,0xce,0x3d,0x02,0x01,0x06,
++			     0x08,0x2a,0x86,0x48,0xce,0x3d,0x03,0x01,
++			     0x07,0x03,0x42,0x00,0x04,0xb5,0x2d,0x7a,
++			     0x71,0x8a,0x3e,0x55,0x0f,0xc4,0xbd,0x10,
++			     0x18,0xfc,0x20,0x33,0x5f,0xd1,0xe5,0x7b,
++			     0xd3,0x3b,0x87,0x45,0x0c,0x2d,0x24,0x82,
++			     0xa8,0x49,0xeb,0xc5,0x06,0x39,0x0a,0xcb,
++			     0xc2,0xdf,0x4c,0x74,0x21,0xde,0x77,0x3e,
++			     0x42,0x76,0x3f,0xa2,0x8b,0xcc,0xde,0x02,
++			     0xc3,0x16,0xf2,0xe9,0x9c,0xb2,0x23,0x44,
++			     0x55,0xaa,0xd5,0x4b,0x23,0xa3,0x26,0x30,
++			     0x24,0x30,0x12,0x06,0x03,0x55,0x1d,0x13,
++			     0x01,0x01,0xff,0x04,0x08,0x30,0x06,0x01,
++			     0x01,0xff,0x02,0x01,0x02,0x30,0x0e,0x06,
++			     0x03,0x55,0x1d,0x0f,0x01,0x01,0xff,0x04,
++			     0x04,0x03,0x02,0x02,0x04,0x30,0x0a,0x06,
++			     0x08,0x2a,0x86,0x48,0xce,0x3d,0x04,0x03,
++			     0x02,0x03,0x48,0x00,0x30,0x45,0x02,0x20,
++			     0x09,0x49,0x1b,0xb1,0xc3,0x57,0x25,0x6a,
++			     0x62,0x80,0x43,0x1c,0xc8,0x0c,0x9c,0x95,
++			     0x05,0x90,0x3e,0x9b,0xd3,0x3d,0xee,0xcb,
++			     0x03,0xfc,0xb7,0x02,0x4e,0x89,0x8d,0xfe,
++			     0x02,0x21,0x00,0xf7,0x84,0xd3,0x66,0xb7,
++			     0xd3,0xff,0x7b,0x37,0xcf,0xa9,0x7c,0xc5,
++			     0x9a,0x02,0x8f,0xa7,0xd1,0xc7,0x0d,0x6f,
++			     0x4e,0x97,0x14,0x0d,0xd1,0x66,0x2b,0x99,
++			     0xa7,0xee,0xfc};
++
++	if (out_size < 355) return -1;
++
++	*out_len = 355;
++	memcpy(out, cert, *out_len);
++	return 0;
++}
+diff --git a/include/drivers/auth/crypto_mod.h b/include/drivers/auth/crypto_mod.h
+index fd49b2d37..19413d23a 100644
+--- a/include/drivers/auth/crypto_mod.h
++++ b/include/drivers/auth/crypto_mod.h
+@@ -79,7 +79,24 @@ typedef struct crypto_lib_desc_s {
+ 			    unsigned int key_flags, const void *iv,
+ 			    unsigned int iv_len, const void *tag,
+ 			    unsigned int tag_len);
+-
++#if defined(DICE_LAYERING) && defined(IMAGE_BL31)
++	int (*derive_seed)(const void *input, size_t input_len,
++			   void *output, size_t output_len);
++
++	int (*derive_keypair_deterministic)(void *seed, size_t seed_len,
++					    //void *out, size_t *out_len,
++					    uint32_t *key_id);
++
++	int (*generate_dice_certificate)(uint32_t subject_key_id,
++					 uint32_t issuer_key_id,
++					 const char *subject_name,
++					 const char *issuer_name,
++					 uint8_t *out_der, size_t max_out_size,
++					 size_t *cert_len);
++
++	int (*import_keypair)(uint8_t *key, size_t key_len,
++			      uint32_t *key_id);
++#endif /* defined(DICE_LAYERING) && defined(IMAGE_BL31) */
+ 	/*
+ 	 * Finish using the crypto library,
+ 	 * anything to be done to wrap up crypto usage done here.
+@@ -132,7 +149,43 @@ static inline void crypto_mod_finish(void)
+ }
+ #endif /* CRYPTO_SUPPORT */
+ 
++#if defined(DICE_LAYERING) && defined(IMAGE_BL31)
++int crypto_mod_derive_seed(const void *input, size_t input_len,
++			   void *output, size_t output_len);
++int crypto_mod_derive_keypair_deterministic(void *seed, size_t seed_len,
++					    //void *out, size_t *out_len,
++					    uint32_t *key_id);
++int crypto_mod_generate_dice_certificate(uint32_t subject_key_id,
++					 uint32_t issuer_key_id,
++					 const char *subject_name,
++					 const char *issuer_name,
++					 uint8_t *out_der, size_t max_out_size,
++					 size_t *cert_len);
++int crypto_mod_import_keypair(uint8_t *key, size_t key_len,
++			      uint32_t *key_id);
++#endif /* defined(DICE_LAYERING) && defined(IMAGE_BL31) */
++
+ /* Macro to register a cryptographic library */
++#if defined(DICE_LAYERING) && defined(IMAGE_BL31)
++#define REGISTER_CRYPTO_LIB(_name, _init, _verify_signature, _verify_hash, \
++			    _calc_hash, _auth_decrypt, _convert_pk, _derive_seed, \
++			    _derive_keypair_deterministic, _generate_dice_certificate, \
++			    _import_keypair, _finish) \
++	const crypto_lib_desc_t crypto_lib_desc = { \
++		.name = _name, \
++		.init = _init, \
++		.verify_signature = _verify_signature, \
++		.verify_hash = _verify_hash, \
++		.calc_hash = _calc_hash, \
++		.auth_decrypt = _auth_decrypt, \
++		.convert_pk = _convert_pk, \
++		.derive_seed = _derive_seed, \
++		.derive_keypair_deterministic = _derive_keypair_deterministic, \
++		.generate_dice_certificate = _generate_dice_certificate, \
++		.import_keypair = _import_keypair, \
++		.finish = _finish \
++	}
++#else
+ #define REGISTER_CRYPTO_LIB(_name, _init, _verify_signature, _verify_hash, \
+ 			    _calc_hash, _auth_decrypt, _convert_pk, _finish) \
+ 	const crypto_lib_desc_t crypto_lib_desc = { \
+@@ -145,7 +198,7 @@ static inline void crypto_mod_finish(void)
+ 		.convert_pk = _convert_pk, \
+ 		.finish = _finish \
+ 	}
+-
++#endif /* defined(DICE_LAYERING) && defined(IMAGE_BL31) */
+ extern const crypto_lib_desc_t crypto_lib_desc;
+ 
+ #endif /* CRYPTO_MOD_H */
+diff --git a/include/drivers/auth/mbedtls/default_mbedtls_config.h b/include/drivers/auth/mbedtls/default_mbedtls_config.h
+index e097eb9a2..c60e466b0 100644
+--- a/include/drivers/auth/mbedtls/default_mbedtls_config.h
++++ b/include/drivers/auth/mbedtls/default_mbedtls_config.h
+@@ -25,7 +25,8 @@
+ #define TF_MBEDTLS_USE_RSA (TF_MBEDTLS_KEY_ALG_ID == TF_MBEDTLS_RSA \
+ 		|| TF_MBEDTLS_KEY_ALG_ID == TF_MBEDTLS_RSA_AND_ECDSA)
+ #define TF_MBEDTLS_USE_ECDSA (TF_MBEDTLS_KEY_ALG_ID == TF_MBEDTLS_ECDSA \
+-		|| TF_MBEDTLS_KEY_ALG_ID == TF_MBEDTLS_RSA_AND_ECDSA)
++		|| TF_MBEDTLS_KEY_ALG_ID == TF_MBEDTLS_RSA_AND_ECDSA \
++		|| DICE_LAYERING == IMAGE_BL31)
+ 
+ /*
+  * Hash algorithms currently supported on mbed TLS libraries
+@@ -96,6 +97,39 @@
+ #define MBEDTLS_X509_USE_C
+ #define MBEDTLS_X509_CRT_PARSE_C
+ 
++#if defined(DICE_LAYERING) //&& defined(IMAGE_BL31)
++#define MBEDTLS_USE_PSA_CRYPTO
++#define MBEDTLS_HMAC_DRBG_C
++#define MBEDTLS_ECDSA_DETERMINISTIC
++#define MBEDTLS_HKDF_C
++#define MBEDTLS_X509_CREATE_C
++#define MBEDTLS_X509_CRT_WRITE_C
++#define MBEDTLS_ASN1_WRITE_C
++#define MBEDTLS_PK_C
++#define MBEDTLS_PK_WRITE_C
++
++#define PSA_WANT_ALG_HKDF 1
++#define MBEDTLS_PSA_BUILTIN_ALG_HKDF 1
++#define PSA_WANT_ALG_HMAC 1
++#define MBEDTLS_PSA_BUILTIN_ALG_HMAC 1
++#define PSA_WANT_ALG_SHA_256 1
++#define MBEDTLS_PSA_BUILTIN_ALG_SHA_256 1
++#define PSA_WANT_KEY_TYPE_DERIVE 1
++#define MBEDTLS_PSA_BUILTIN_KEY_TYPE_DERIVE 1
++#define PSA_WANT_KEY_TYPE_ECC_KEY_PAIR_DERIVE 1
++#define MBEDTLS_PSA_BUILTIN_KEY_TYPE_ECC_KEY_PAIR_DERIVE 1
++#define PSA_WANT_ALG_DETERMINISTIC_ECDSA 1
++#define MBEDTLS_PSA_BUILTIN_ALG_DETERMINISTIC_ECDSA 1
++
++#define MBEDTLS_ECP_C
++#define MBEDTLS_ECDSA_C
++#define MBEDTLS_ECP_DP_SECP256R1_ENABLED
++
++#define MBEDTLS_PSA_NO_RNG
++#define MBEDTLS_ECP_NO_INTERNAL_RNG
++#define MBEDTLS_PSA_CRYPTO_EXTERNAL_RNG
++#endif
++
+ #if TF_MBEDTLS_USE_AES_GCM
+ #define MBEDTLS_AES_C
+ #define MBEDTLS_CIPHER_C
+@@ -129,6 +163,23 @@
+ #ifndef __ASSEMBLER__
+ /* System headers required to build mbed TLS with the current configuration */
+ #include <stdlib.h>
++#include <string.h>
++
++/* TF-A's custom libc explicitly removes strncpy for security reasons,
++ * but Mbed TLS still requires it for X.509 certificate generation.
++ * We provide a safe, inline polyfill here.
++ */
++static inline char *strncpy(char *dst, const char *src, size_t n)
++{
++	size_t i;
++	for (i = 0; i < n && src[i] != '\0'; i++) {
++		dst[i] = src[i];
++	}
++	for ( ; i < n; i++) {
++		dst[i] = '\0';
++	}
++	return dst;
++}
+ #endif
+ 
+ /*
+diff --git a/include/drivers/dice_layering/dice_layering.h b/include/drivers/dice_layering/dice_layering.h
+new file mode 100644
+index 000000000..5b240743f
+--- /dev/null
++++ b/include/drivers/dice_layering/dice_layering.h
+@@ -0,0 +1,43 @@
++#ifndef _DICE_LAYERING_H_
++#define _DICE_LAYERING_H_
++
++#include <common/bl_common.h>
++#include <drivers/auth/crypto_mod.h>
++
++#define CDI_LEN      U(32)
++#define TCI_LEN      U(32)
++#define SEC_KEY_LEN  U(32)
++#define SEED_LEN     (CDI_LEN + TCI_LEN)
++#define CERT_MAX_LEN U(512)
++
++/*
++ * Data structure with the dice layering objects that must be passed
++ * to the rmm.
++ */
++struct dice_manifest_data {
++	/*
++	 * The CDI is computed as HKDF(CDI(TFA) || TCI(RMM))
++	 */
++	uint8_t cdi_rmm[32];
++	/*
++	 * Certificate of the RAK public key. The RAK is deterministically generated
++	 * from the cdi_rmm. So, the RMM can re-derive it. The usage of a different
++	 * key can be detected from the verifier since the entire CoT must is sent.
++	 */
++	uint8_t cert_rak[400];
++	size_t cert_rak_len;
++	/*
++	 * Certificate of the TFA public key. This is the parent of the
++	 * RAK certificate in the CoT.
++	 */
++	uint8_t cert_tfa[400];
++	size_t cert_tfa_len;
++};
++
++int dice_layering_measure_image(unsigned int image_id, image_info_t *image_data);
++
++void save_tci_in_shared_ram(void);
++void read_tci_from_shared_ram(void);
++void dice_layering_prepare_rmm_data(void);
++void zero_global_buffers(void);
++#endif /*_DICE_LAYERING_H_*/
+diff --git a/include/drivers/dice_layering/dice_layering_hardcoded.h b/include/drivers/dice_layering/dice_layering_hardcoded.h
+new file mode 100644
+index 000000000..a7f3467e6
+--- /dev/null
++++ b/include/drivers/dice_layering/dice_layering_hardcoded.h
+@@ -0,0 +1,12 @@
++#ifndef _DICE_LAYERING_HARDCODED_
++#define _DICE_LAYERING_HARDCODED_
++
++#include <stdint.h>
++#include <stddef.h>
++#include <string.h>
++
++int get_cdi0(uint8_t *out, size_t out_size, size_t *out_len);
++int get_tfa_seck(uint8_t *out, size_t out_size,size_t *out_len);
++int get_tfa_cert(uint8_t *out, size_t out_size,size_t *out_len);
++
++#endif /* _DICE_LAYERING_HARDCODED_ */
+diff --git a/plat/qemu/common/qemu_common.c b/plat/qemu/common/qemu_common.c
+index 4a79a908c..08ba916a3 100644
+--- a/plat/qemu/common/qemu_common.c
++++ b/plat/qemu/common/qemu_common.c
+@@ -23,6 +23,10 @@
+ #include <plat/common/platform.h>
+ #include "qemu_private.h"
+ 
++#if DICE_LAYERING
++#include <drivers/dice_layering/dice_layering.h>
++#endif
++
+ #define MAP_DEVICE0	MAP_REGION_FLAT(DEVICE0_BASE,			\
+ 					DEVICE0_SIZE,			\
+ 					MT_DEVICE | MT_RW | EL3_PAS)
+@@ -167,7 +171,7 @@ const mmap_region_t *plat_qemu_get_mmap(void)
+ 	return plat_qemu_mmap;
+ }
+ 
+-#if MEASURED_BOOT || TRUSTED_BOARD_BOOT
++#if MEASURED_BOOT || TRUSTED_BOARD_BOOT || DICE_LAYERING
+ int plat_get_mbedtls_heap(void **heap_addr, size_t *heap_size)
+ {
+ 	return get_mbedtls_heap_helper(heap_addr, heap_size);
+@@ -274,7 +278,165 @@ static uint64_t checksum_calc(uint64_t *buffer, size_t size)
+ 
+ 	return sum;
+ }
++#if DICE_LAYERING
++/*
++ * If DICE_LAYERING is enabled, the platform data field of the manifest
++ * points to the dice_data_manifest struct that contains:
++ *   - the rmm cdi
++ *   - the certificate of the rmm public key
++ *   - the certificate of the tfa public key
++ */
++int plat_rmmd_load_manifest(struct rmm_manifest *manifest)
++{
++	int i, last;
++	uint64_t checksum;
++	size_t num_banks = plat_get_num_memnodes();
++	size_t num_consoles = 1;
++	struct memory_bank *bank_ptr;
++	struct console_info *console_ptr;
++	struct dice_manifest_data *dice_ptr;
++
++	extern uint8_t cdi_rmm[CDI_LEN];
++	extern size_t cdi_rmm_len;
++
++	extern uint8_t rmm_cert[CERT_MAX_LEN];
++	extern size_t rmm_cert_len;
++
++	extern uint8_t tfa_cert[CERT_MAX_LEN];
++	extern size_t tfa_cert_len;
++
++	assert(manifest != NULL);
++
++	manifest->version = RMMD_MANIFEST_VERSION;
++	manifest->padding = 0U; /* RES0 */
++	manifest->plat_data = (uintptr_t)NULL;
++	manifest->plat_dram.num_banks = num_banks;
++	manifest->plat_console.num_consoles = num_consoles;
++
++	/*
++	 * Boot manifest structure illustration:
++	 *
++	 * +----------------------------------------+
++	 * |  offset  |   field      |  comment     |
++	 * +----------+--------------+--------------+
++	 * |    0     |  version     | 0x00000003   |
++	 * +----------+--------------+--------------+
++	 * |    4     |  padding     | 0x00000000   |
++	 * +----------+--------------+--------------+
++	 * |    8     | plat_data    | dice_data    |
++	 * +----------+--------------+--------------+
++	 * |    16    | num_banks    |              |
++	 * +----------+--------------+              |
++	 * |    24    |   banks      | plat_dram    |
++	 * +----------+--------------+              |
++	 * |    32    | checksum     |              |
++	 * +----------+--------------+--------------+
++	 * |    40    | num_consoles |              |
++	 * +----------+--------------+              |
++	 * |    48    | consoles     | plat_console |
++	 * +----------+--------------+              |
++	 * |    56    | checksum     |              |
++	 * +----------+--------------+--------------+
++	 * |    64    |  base 0      |              |
++	 * +----------+--------------+   bank[0]    |
++	 * |    72    |  size 0      |              |
++	 * +----------+--------------+--------------+
++	 * |    80    |  base        |              |
++	 * +----------+--------------+              |
++	 * |    88    |  map_pages   |              |
++	 * +----------+--------------+              |
++	 * |    96    |  name        |              |
++	 * +----------+--------------+  consoles[0] |
++	 * |   104    |  clk_in_hz   |              |
++	 * +----------+--------------+              |
++	 * |   112    |  baud_rate   |              |
++	 * +----------+--------------+              |
++	 * |   120    |  flags       |              |
++	 * +----------+--------------+--------------+
++	 */
++	bank_ptr = (struct memory_bank *)
++		(((uintptr_t)manifest) + sizeof(*manifest));
++
++	console_ptr = (struct console_info *)
++		((uintptr_t)bank_ptr + (num_banks * sizeof(*bank_ptr)));
++
++	dice_ptr = (struct dice_manifest_data *)
++		((uintptr_t)console_ptr + (num_consoles * sizeof(*console_ptr)));
++
++	manifest->plat_dram.banks = bank_ptr;
++	manifest->plat_console.consoles = console_ptr;
++
++	manifest->plat_data = (uintptr_t)dice_ptr;
++
++	/* Ensure the manifest is not larger than the shared buffer */
++	assert((sizeof(struct rmm_manifest) +
++		(sizeof(struct console_info) * num_consoles) +
++		(sizeof(struct memory_bank) * num_banks)) +
++		(sizeof(struct dice_manifest_data)) <= RMM_SHARED_SIZE);
++
++	/* Calculate checksum of plat_dram structure */
++	checksum = num_banks + (uint64_t)bank_ptr;
++
++	/*
++	 * In the TF-A, NUMA nodes (if present) are stored in descending
++	 * order, i.e:
++	 *
++	 * INFO:    RAM 0: node-id: 1, address: 0x10080000000 - 0x101ffffffff
++	 * INFO:    RAM 1: node-id: 0, address: 0x10043000000 - 0x1007fffffff
++	 *
++	 * The RMM expects the memory banks to be presented in ascending order:
++	 *
++	 * INFO:    RAM 1: node-id: 0, address: 0x10043000000 - 0x1007fffffff
++	 * INFO:    RAM 0: node-id: 1, address: 0x10080000000 - 0x101ffffffff
++	 *
++	 * As such, go through the NUMA nodes one by one and fill out
++	 * @bank_ptr[] starting from the end.  When NUMA nodes are not present
++	 * there is only one memory bank and none of the above matters.
++	 */
++	last = num_banks - 1;
++	for (i = 0; i < num_banks; i++) {
++		plat_get_memory_node(i, &bank_ptr[last]);
++		last--;
++	}
++
++	checksum += checksum_calc((uint64_t *)bank_ptr,
++				  num_banks * sizeof(*bank_ptr));
++
++	/* Checksum must be 0 */
++	manifest->plat_dram.checksum = ~checksum + 1UL;
++
++	/* Calculate the checksum of the plat_consoles structure */
++	checksum = num_consoles + (uint64_t)console_ptr;
++
++	/* Zero out the console info struct */
++	memset((void *)console_ptr, 0, sizeof(struct console_info) * num_consoles);
++
++	console_ptr[0].map_pages = 1;
++	console_ptr[0].base = PLAT_QEMU_BOOT_UART_BASE;
++	console_ptr[0].clk_in_hz = PLAT_QEMU_BOOT_UART_CLK_IN_HZ;
++	console_ptr[0].baud_rate = PLAT_QEMU_CONSOLE_BAUDRATE;
++
++	strlcpy(console_ptr[0].name, "pl011", sizeof(console_ptr[0].name));
+ 
++	/* Update checksum */
++	checksum += checksum_calc((uint64_t *)console_ptr,
++				  num_consoles * sizeof(*console_ptr));
++
++	/* Checksum must be 0 */
++	manifest->plat_console.checksum = ~checksum + 1UL;
++
++	memcpy(dice_ptr->cdi_rmm, cdi_rmm, cdi_rmm_len);
++	memcpy(dice_ptr->cert_rak, rmm_cert, rmm_cert_len);
++	memcpy(dice_ptr->cert_tfa, tfa_cert, tfa_cert_len);
++
++	dice_ptr->cert_rak_len = rmm_cert_len;
++	dice_ptr->cert_tfa_len = tfa_cert_len;
++
++	zero_global_buffers();
++
++	return 0;
++}
++#else
+ int plat_rmmd_load_manifest(struct rmm_manifest *manifest)
+ {
+ 	int i, last;
+@@ -400,7 +562,7 @@ int plat_rmmd_load_manifest(struct rmm_manifest *manifest)
+ 
+ 	return 0;
+ }
+-
++#endif /* DICE_LAYERING */
+ /*
+  * Update encryption key associated with @mecid.
+  */
+diff --git a/plat/qemu/qemu_sbsa/include/platform_def.h b/plat/qemu/qemu_sbsa/include/platform_def.h
+index 85bd233d4..eb33a3388 100644
+--- a/plat/qemu/qemu_sbsa/include/platform_def.h
++++ b/plat/qemu/qemu_sbsa/include/platform_def.h
+@@ -187,8 +187,10 @@
+ #define MAX_MMAP_REGIONS		13
+ #define MAX_XLAT_TABLES			13
+ #elif ENABLE_RME
+-#define MAX_MMAP_REGIONS		15
+-#define MAX_XLAT_TABLES			15
++//#define MAX_MMAP_REGIONS		15
++//#define MAX_XLAT_TABLES			15
++#define MAX_MMAP_REGIONS		14
++#define MAX_XLAT_TABLES			13
+ #else
+ #define MAX_MMAP_REGIONS		12
+ #define MAX_XLAT_TABLES			12
+diff --git a/plat/qemu/qemu_sbsa/platform.mk b/plat/qemu/qemu_sbsa/platform.mk
+index 8ec3a8249..04fc0d371 100644
+--- a/plat/qemu/qemu_sbsa/platform.mk
++++ b/plat/qemu/qemu_sbsa/platform.mk
+@@ -47,6 +47,21 @@ ifeq (${SPM_MM},1)
+ 	BL31_SOURCES		+=	${PLAT_QEMU_COMMON_PATH}/qemu_spm.c
+ endif
+ 
++ifeq (${DICE_LAYERING},1)
++    include drivers/dice_layering/dice_layering.mk
++
++    AUTH_MK := drivers/auth/auth.mk
++    $(info Including ${AUTH_MK})
++    include ${AUTH_MK}
++    include drivers/auth/mbedtls/mbedtls_crypto.mk
++
++    CRYPTO_SOURCES    :=    drivers/auth/crypto_mod.c
++
++    BL1_SOURCES        +=    ${CRYPTO_SOURCES}
++    BL2_SOURCES        +=    ${CRYPTO_SOURCES}
++
++endif #(${DICE_LAYERING},1)
++
+ # Use known base for UEFI if not given from command line
+ # By default BL33 is at FLASH1 base
+ PRELOADED_BL33_BASE	?= 0x10000000
+diff --git a/services/std_svc/rmmd/rmmd_main.c b/services/std_svc/rmmd/rmmd_main.c
+index 35582dcfd..0ccee18a1 100644
+--- a/services/std_svc/rmmd/rmmd_main.c
++++ b/services/std_svc/rmmd/rmmd_main.c
+@@ -39,6 +39,10 @@
+ #include "rmmd_initial_context.h"
+ #include "rmmd_private.h"
+ 
++#ifdef DICE_LAYERING
++#include <drivers/dice_layering/dice_layering.h>
++#endif /* DICE_LAYERING */
++
+ /*******************************************************************************
+  * RMM boot failure flag
+  ******************************************************************************/
+@@ -261,6 +265,10 @@ int rmmd_setup(void)
+ 	assert((shared_buf_size == SZ_4K) &&
+ 					((void *)shared_buf_base != NULL));
+ 
++#ifdef DICE_LAYERING
++	dice_layering_prepare_rmm_data();
++#endif /* DICE_LAYERING */
++
+ 	/* Zero out and load the boot manifest at the beginning of the share area */
+ 	manifest = (struct rmm_manifest *)shared_buf_base;
+ 	(void)memset((void *)manifest, 0, sizeof(struct rmm_manifest));
+-- 
+2.54.0
+

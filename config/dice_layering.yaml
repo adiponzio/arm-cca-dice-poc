@@ -1,0 +1,36 @@
+
+# Copyright (c) 2024, Linaro Limited.
+# SPDX-License-Identifier: MIT
+
+%YAML 1.2
+---
+description: >-
+  Enable the DICE Layering feature for Realm key provisioning.
+
+buildex:
+  runners:
+    QEMU:
+      mbedtls:
+        repo:
+          remote: https://github.com/Mbed-TLS/mbedtls.git
+          revision: mbedtls-3.6.3
+
+        artifacts:
+          mbedtls_sourcedir: ${param:sourcedir}
+
+      tfa:
+        params:
+          DEBUG: 1
+          LOG_LEVEL: 40
+          DICE_LAYERING: 1
+          MBEDTLS_DIR: ${artifact:mbedtls_sourcedir}
+          CRYPTO_SUPPORT: 2
+          PSA_CRYPTO: 1
+
+        artifacts:
+          BL1: ${param:builddir}/qemu_sbsa/debug/bl1.bin
+          FIP: ${param:builddir}/qemu_sbsa/debug/fip.bin
+
+      rmm:
+        params:
+          -DLOG_LEVEL: 50

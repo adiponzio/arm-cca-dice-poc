@@ -1,0 +1,21 @@
+
+# Copyright (c) 2024, Linaro Limited.
+# SPDX-License-Identifier: MIT
+
+%YAML 1.2
+---
+description: >-
+  Measure the DICE layering performance.
+
+buildex:
+  runners:
+    QEMU:
+      tfa:
+        params:
+#          DEBUG: 0
+          MEASURE_BL31: 1
+
+build:
+      rmm:
+        params:
+          CMAKE_C_FLAGS: "-DMEASURE_RMM=1"

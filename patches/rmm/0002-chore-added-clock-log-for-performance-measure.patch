@@ -1,0 +1,52 @@
+From 6310b750272b388fc9b714103f16ea4f60e7d547 Mon Sep 17 00:00:00 2001
+From: Antonio Di Ponzio <antoniodiponzio@protonmail.com>
+Date: Fri, 31 Jul 2026 15:12:56 +0200
+Subject: [PATCH 2/3] chore: added clock log for performance measure
+
+---
+ runtime/rmi/realm.c | 15 +++++++++++++++
+ 1 file changed, 15 insertions(+)
+
+diff --git a/runtime/rmi/realm.c b/runtime/rmi/realm.c
+index b74f1ec..bf3649d 100644
+--- a/runtime/rmi/realm.c
++++ b/runtime/rmi/realm.c
+@@ -22,6 +22,7 @@
+ #include <dice_layering_app.h>
+ 
+ #define RMI_FEATURE_MIN_IPA_SIZE	PARANGE_WIDTH_32BITS
++#define MEASURE_RMM
+ 
+ unsigned long smc_realm_activate(unsigned long rd_addr)
+ {
+@@ -55,6 +56,13 @@ unsigned long smc_realm_activate(unsigned long rd_addr)
+ 
+ 	granule_unlock(g_rd);
+ 
++#ifdef MEASURE_RMM
++	unsigned long end_ticks, freq;
++	end_ticks = read_cntpct_el0();
++	freq = read_cntfrq_el0();
++	NOTICE("RMM_PERF_START: end=%lu, freq=%lu\n", end_ticks, freq);
++#endif
++
+ 	return ret;
+ }
+ 
+@@ -406,6 +414,13 @@ unsigned long smc_realm_create(unsigned long rd_addr,
+ 	struct rd *rd;
+ 	struct rmi_realm_params p;
+ 
++#ifdef MEASURE_RMM
++	unsigned long start_ticks, freq;
++	start_ticks = read_cntpct_el0();
++	freq = read_cntfrq_el0();
++	NOTICE("RMM_PERF_START: start=%lu, freq=%lu\n", start_ticks, freq);
++#endif
++
+ 	if (!get_realm_params(&p, realm_params_addr)) {
+ 		return RMI_ERROR_INPUT;
+ 	}
+-- 
+2.54.0
+

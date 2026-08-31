@@ -1,0 +1,490 @@
+From 5104a5db434a504b1d916acac3283c44d925807a Mon Sep 17 00:00:00 2001
+From: Antonio Di Ponzio <antoniodiponzio@protonmail.com>
+Date: Mon, 31 Aug 2026 15:29:46 +0200
+Subject: [PATCH 3/3] fix: fixed certificate generation adding DICE profile
+ constraints
+
+---
+ Makefile                                      |   5 +
+ bl2/bl2_image_load_v2.c                       |   2 +-
+ drivers/auth/crypto_mod.c                     |   8 +-
+ drivers/auth/mbedtls/mbedtls_psa_crypto.c     | 158 +++++++++++++++++-
+ drivers/dice_layering/dice_layering.c         |   7 +-
+ .../dice_layering/dice_layering_hardcoded.c   | 104 ++++++------
+ include/drivers/auth/crypto_mod.h             |   6 +-
+ include/drivers/dice_layering/dice_layering.h |   8 +-
+ services/std_svc/rmmd/rmmd_main.c             |   2 +-
+ 9 files changed, 237 insertions(+), 63 deletions(-)
+
+diff --git a/Makefile b/Makefile
+index 85cbc61dc..cab14b744 100644
+--- a/Makefile
++++ b/Makefile
+@@ -757,6 +757,11 @@ ifeq (${ARCH},aarch32)
+         endif
+ endif #(ARCH=aarch32)
+ 
++################################################################################
++# By default the DICE feature is disabled.
++################################################################################
++DICE_LAYERING ?= 0
++
+ ################################################################################
+ # Include libc if not overridden
+ ################################################################################
+diff --git a/bl2/bl2_image_load_v2.c b/bl2/bl2_image_load_v2.c
+index 4d8d255b0..12a0da0ad 100644
+--- a/bl2/bl2_image_load_v2.c
++++ b/bl2/bl2_image_load_v2.c
+@@ -77,7 +77,7 @@ struct entry_point_info *bl2_load_images(void)
+ 				      bl2_node_info->image_id, err);
+ 				plat_error_handler(err);
+ 			}
+-#ifdef DICE_LAYERING
++#if DICE_LAYERING
+ 			/*
+ 			 * If the current loaded image is the RMM, measure the TCI.
+ 			 */
+diff --git a/drivers/auth/crypto_mod.c b/drivers/auth/crypto_mod.c
+index 9b0dd8682..54ea3bb30 100644
+--- a/drivers/auth/crypto_mod.c
++++ b/drivers/auth/crypto_mod.c
+@@ -254,7 +254,8 @@ int crypto_mod_generate_dice_certificate(uint32_t subject_key_id,
+ 					 const char *subject_name,
+ 					 const char *issuer_name,
+ 					 uint8_t *out_der, size_t max_out_size,
+-					 size_t *cert_len)
++					 size_t *cert_len,
++					 uint8_t *fw_tci, size_t fw_tci_len)
+ {
+ 	assert(crypto_lib_desc.generate_dice_certificate != NULL);
+ 	assert(subject_key_id != 0);
+@@ -264,11 +265,14 @@ int crypto_mod_generate_dice_certificate(uint32_t subject_key_id,
+ 	assert(out_der != NULL);
+ 	assert(max_out_size != 0);
+ 	assert(cert_len != NULL);
++	assert(fw_tci != NULL);
++	assert(fw_tci_len != 0);
+ 
+ 	return crypto_lib_desc.generate_dice_certificate(subject_key_id, issuer_key_id,
+ 							 subject_name, issuer_name,
+ 							 out_der, max_out_size,
+-							 cert_len);
++							 cert_len,
++							 fw_tci, fw_tci_len);
+ }
+ /*
+  * Import a keypair inside the vault from an array.
+diff --git a/drivers/auth/mbedtls/mbedtls_psa_crypto.c b/drivers/auth/mbedtls/mbedtls_psa_crypto.c
+index 9b815b8d7..1f1e6833f 100644
+--- a/drivers/auth/mbedtls/mbedtls_psa_crypto.c
++++ b/drivers/auth/mbedtls/mbedtls_psa_crypto.c
+@@ -671,6 +671,80 @@ end:
+ 	psa_key_derivation_abort(&deriv_op);
+ 	return status;
+ }
++#include <mbedtls/asn1write.h>
++#include <psa/crypto.h>
++
++/*
++ * Manually builds and injects the SKID and AKID X.509 extensions using SHA-256
++ * since SHA-1 is not available in CCA tcb.
++ */
++static int add_key_identifiers(mbedtls_x509write_cert *crt,
++			       mbedtls_pk_context *subject_pk,
++			       mbedtls_pk_context *issuer_pk)
++{
++	int ret;
++	unsigned char pub_buf[256];
++	unsigned char hash[32];
++	size_t hash_len;
++	unsigned char ext_buf[64];
++	unsigned char *p;
++	size_t ext_len;
++
++	/* Subject Key Identifier (SKID) */
++	ret = mbedtls_pk_write_pubkey_der(subject_pk, pub_buf, sizeof(pub_buf));
++	if (ret < 0) return ret;
++
++	if (psa_hash_compute(PSA_ALG_SHA_256,
++			     pub_buf + sizeof(pub_buf) - ret, ret,
++			     hash, sizeof(hash), &hash_len) != PSA_SUCCESS) {
++		return -1;
++	}
++
++	ext_len = 0;
++	p = ext_buf + sizeof(ext_buf);
++
++	/* SKID is a standard ASN.1 OCTET STRING */
++	ret = mbedtls_asn1_write_octet_string(&p, ext_buf, hash, 20); /* Use first 20 bytes */
++	if (ret < 0) return ret;
++	ext_len += ret;
++
++	ret = mbedtls_x509write_crt_set_extension(crt, "\x55\x1D\x0E", 3, 0, p, ext_len);
++	if (ret != 0) return ret;
++
++
++	/* Authority Key Identifier (AKID) */
++	ret = mbedtls_pk_write_pubkey_der(issuer_pk, pub_buf, sizeof(pub_buf));
++	if (ret < 0) return ret;
++
++	if (psa_hash_compute(PSA_ALG_SHA_256,
++			     pub_buf + sizeof(pub_buf) - ret, ret,
++			     hash, sizeof(hash), &hash_len) != PSA_SUCCESS) {
++		return -1;
++	}
++
++	ext_len = 0;
++	p = ext_buf + sizeof(ext_buf);
++
++	/* AKID is a SEQUENCE containing an IMPLICIT [0] KeyIdentifier */
++	ret = mbedtls_asn1_write_octet_string(&p, ext_buf, hash, 20);
++	if (ret < 0) return ret;
++	/* Overwrite standard OCTET STRING tag (0x04) with context-specific [0] (0x80) */
++	*p = MBEDTLS_ASN1_CONTEXT_SPECIFIC | 0;
++	ext_len += ret;
++
++	ret = mbedtls_asn1_write_len(&p, ext_buf, ext_len);
++	if (ret < 0) return ret;
++	ext_len += ret;
++
++	ret = mbedtls_asn1_write_tag(&p, ext_buf,
++				     MBEDTLS_ASN1_CONSTRUCTED | MBEDTLS_ASN1_SEQUENCE);
++	if (ret < 0) return ret;
++	ext_len += ret;
++
++	ret = mbedtls_x509write_crt_set_extension(crt, "\x55\x1D\x23", 3, 0, p, ext_len);
++	return ret;
++}
++
+ /*
+  * Derive a keypair deterministically from a given seed.
+  *
+@@ -743,13 +817,74 @@ end:
+ 
+ 	return status;
+ }
+-
++/*
++ * Builds a DICE TCB Info ASN.1 DER payload containing ONLY the fwid.
++ */
++static int build_fwid_only_tcb_info(unsigned char *buf, size_t buf_size,
++				    const unsigned char *fw_hash, size_t fw_hash_len)
++{
++	int ret;
++	size_t len = 0;
++
++	/* Mbed TLS writes backwards from the end of the buffer */
++	unsigned char *p = buf + buf_size;
++	unsigned char *start = buf;
++
++	/* [6] IMPLICIT SEQUENCE OF FWID: fwids */
++	size_t fwid_len = 0;
++
++	/* Write digest */
++	ret = mbedtls_asn1_write_octet_string(&p, start, fw_hash, fw_hash_len);
++	if (ret < 0) return ret;
++	fwid_len += ret;
++
++	/* Write hashAlg (OID) SHA256 */
++	ret = mbedtls_asn1_write_oid(&p, start,
++				     MBEDTLS_OID_DIGEST_ALG_SHA256,
++				     sizeof(MBEDTLS_OID_DIGEST_ALG_SHA256) - 1);
++	if (ret < 0) return ret;
++	fwid_len += ret;
++
++	/* Wrap in standard SEQUENCE tag (0x30) for the single FWID item */
++	ret = mbedtls_asn1_write_len(&p, start, fwid_len);
++	if (ret < 0) return ret;
++	fwid_len += ret;
++	ret = mbedtls_asn1_write_tag(&p, start,
++				     MBEDTLS_ASN1_CONSTRUCTED | MBEDTLS_ASN1_SEQUENCE);
++	if (ret < 0) return ret;
++	fwid_len += ret;
++
++	/* 4. Wrap in IMPLICIT [6] tag (0xA6 = CONSTRUCTED | CONTEXT_SPECIFIC | 6) */
++	ret = mbedtls_asn1_write_len(&p, start, fwid_len);
++	if (ret < 0) return ret;
++	len += fwid_len + ret;
++
++	ret = mbedtls_asn1_write_tag(&p, start,
++				     MBEDTLS_ASN1_CONTEXT_SPECIFIC | MBEDTLS_ASN1_CONSTRUCTED | 6);
++	if (ret < 0) return ret;
++	len += ret;
++
++	/* Wrap everything in the master DiceTcbInfo SEQUENCE (0x30) */
++	ret = mbedtls_asn1_write_len(&p, start, len);
++	if (ret < 0) return ret;
++	len += ret;
++
++	ret = mbedtls_asn1_write_tag(&p, start,
++				     MBEDTLS_ASN1_CONSTRUCTED | MBEDTLS_ASN1_SEQUENCE);
++	if (ret < 0) return ret;
++	len += ret;
++
++	memmove(buf, p, len);
++
++	return (int)len;
++}
+ static int generate_dice_certificate(psa_key_id_t subject_key_id,
+ 				     psa_key_id_t issuer_key_id,
+ 				     const char *subject_name,
+ 				     const char *issuer_name,
+ 				     uint8_t *out_der, size_t max_out_size,
+-				     size_t *cert_len)
++				     size_t *cert_len,
++				     uint8_t *fw_tci, size_t fw_tci_len)
+ {
+ 	int ret;
+ 	mbedtls_pk_context subject_pk;
+@@ -757,6 +892,9 @@ static int generate_dice_certificate(psa_key_id_t subject_key_id,
+ 	mbedtls_x509write_cert crt;
+ 	mbedtls_mpi serial;
+ 
++	unsigned char dice_info_buf[128];
++	size_t dice_info_buf_len;
++
+ 	/* Standard RNG context needed by the X.509 module for internal formatting */
+ 	//mbedtls_ctr_drbg_context ctr_drbg;
+ 	//mbedtls_entropy_context entropy;
+@@ -803,7 +941,7 @@ static int generate_dice_certificate(psa_key_id_t subject_key_id,
+ 						 "99991231235959");
+ 	if (ret != 0) goto cleanup;
+ 
+-	mbedtls_mpi_lset(&serial, 1);
++	mbedtls_mpi_lset(&serial, 2);
+ 	ret = mbedtls_x509write_crt_set_serial(&crt, &serial);
+ 	if (ret != 0) goto cleanup;
+ 
+@@ -817,6 +955,20 @@ static int generate_dice_certificate(psa_key_id_t subject_key_id,
+ 	ret = mbedtls_x509write_crt_set_key_usage(&crt, MBEDTLS_X509_KU_KEY_CERT_SIGN);
+ 	if (ret != 0) goto cleanup;
+ 
++	ret = add_key_identifiers(&crt, &subject_pk, &issuer_pk);
++	if (ret != 0) goto cleanup;
++
++	ret = build_fwid_only_tcb_info(dice_info_buf, sizeof(dice_info_buf),
++				       fw_tci, fw_tci_len);
++	if (ret < 0) goto cleanup;
++
++	dice_info_buf_len = (size_t)ret;
++	ret = mbedtls_x509write_crt_set_extension(&crt,
++                                                  "\x67\x81\x05\x05\x04\x01", 6,
++                                                  0, /* Non-critical */
++                                                  dice_info_buf, dice_info_buf_len);
++        if (ret != 0) goto cleanup;
++
+ 	/* clean the memory for the certificate */
+ 	memset(out_der, 0, max_out_size);
+ 
+diff --git a/drivers/dice_layering/dice_layering.c b/drivers/dice_layering/dice_layering.c
+index 17d46a4cd..85b469f7d 100644
+--- a/drivers/dice_layering/dice_layering.c
++++ b/drivers/dice_layering/dice_layering.c
+@@ -169,9 +169,10 @@ void dice_layering_prepare_rmm_data(void)
+ 	/* Generate the certificate signed with the TFA key */
+ 	rc = crypto_mod_generate_dice_certificate(rmm_key_id, tfa_key_id,
+ 						  "CN=RMM,O=CCA_Machine",
+-					     	  "CN=TFA,O=CCA_Machine",
+-					     	  rmm_cert, sizeof(rmm_cert),
+-						  &rmm_cert_len);
++						  "CN=TFA,O=CCA_Machine",
++						  rmm_cert, sizeof(rmm_cert),
++						  &rmm_cert_len,
++						  tci_rmm, tci_rmm_len);
+ 	//assert(rc == 0);
+ 	if (rc != 0) {
+ 		ERROR("DICE layering failed with error: %d\n", rc);
+diff --git a/drivers/dice_layering/dice_layering_hardcoded.c b/drivers/dice_layering/dice_layering_hardcoded.c
+index f8ec8e8fd..220dd86f8 100644
+--- a/drivers/dice_layering/dice_layering_hardcoded.c
++++ b/drivers/dice_layering/dice_layering_hardcoded.c
+@@ -34,55 +34,65 @@ int get_tfa_seck(uint8_t *out, size_t out_size, size_t *out_len)
+ 
+ int get_tfa_cert(uint8_t *out, size_t out_size, size_t *out_len)
+ {
+-	uint8_t cert[355] = {0x30,0x82,0x01,0x5f,0x30,0x82,0x01,0x05,
+-			     0xa0,0x03,0x02,0x01,0x02,0x02,0x01,0x01,
+-			     0x30,0x0a,0x06,0x08,0x2a,0x86,0x48,0xce,
+-			     0x3d,0x04,0x03,0x02,0x30,0x24,0x31,0x0c,
+-			     0x30,0x0a,0x06,0x03,0x55,0x04,0x03,0x0c,
+-			     0x03,0x54,0x46,0x41,0x31,0x14,0x30,0x12,
+-			     0x06,0x03,0x55,0x04,0x0a,0x0c,0x0b,0x43,
+-			     0x43,0x41,0x5f,0x4d,0x61,0x63,0x68,0x69,
+-			     0x6e,0x65,0x30,0x20,0x17,0x0d,0x32,0x34,
+-			     0x30,0x31,0x30,0x31,0x30,0x30,0x30,0x30,
+-			     0x30,0x30,0x5a,0x18,0x0f,0x32,0x30,0x39,
+-			     0x39,0x31,0x32,0x33,0x31,0x32,0x33,0x35,
+-			     0x39,0x35,0x39,0x5a,0x30,0x24,0x31,0x0c,
+-			     0x30,0x0a,0x06,0x03,0x55,0x04,0x03,0x0c,
+-			     0x03,0x54,0x46,0x41,0x31,0x14,0x30,0x12,
+-			     0x06,0x03,0x55,0x04,0x0a,0x0c,0x0b,0x43,
+-			     0x43,0x41,0x5f,0x4d,0x61,0x63,0x68,0x69,
+-			     0x6e,0x65,0x30,0x59,0x30,0x13,0x06,0x07,
+-			     0x2a,0x86,0x48,0xce,0x3d,0x02,0x01,0x06,
+-			     0x08,0x2a,0x86,0x48,0xce,0x3d,0x03,0x01,
+-			     0x07,0x03,0x42,0x00,0x04,0xb5,0x2d,0x7a,
+-			     0x71,0x8a,0x3e,0x55,0x0f,0xc4,0xbd,0x10,
+-			     0x18,0xfc,0x20,0x33,0x5f,0xd1,0xe5,0x7b,
+-			     0xd3,0x3b,0x87,0x45,0x0c,0x2d,0x24,0x82,
+-			     0xa8,0x49,0xeb,0xc5,0x06,0x39,0x0a,0xcb,
+-			     0xc2,0xdf,0x4c,0x74,0x21,0xde,0x77,0x3e,
+-			     0x42,0x76,0x3f,0xa2,0x8b,0xcc,0xde,0x02,
+-			     0xc3,0x16,0xf2,0xe9,0x9c,0xb2,0x23,0x44,
+-			     0x55,0xaa,0xd5,0x4b,0x23,0xa3,0x26,0x30,
+-			     0x24,0x30,0x12,0x06,0x03,0x55,0x1d,0x13,
+-			     0x01,0x01,0xff,0x04,0x08,0x30,0x06,0x01,
+-			     0x01,0xff,0x02,0x01,0x02,0x30,0x0e,0x06,
+-			     0x03,0x55,0x1d,0x0f,0x01,0x01,0xff,0x04,
+-			     0x04,0x03,0x02,0x02,0x04,0x30,0x0a,0x06,
+-			     0x08,0x2a,0x86,0x48,0xce,0x3d,0x04,0x03,
+-			     0x02,0x03,0x48,0x00,0x30,0x45,0x02,0x20,
+-			     0x09,0x49,0x1b,0xb1,0xc3,0x57,0x25,0x6a,
+-			     0x62,0x80,0x43,0x1c,0xc8,0x0c,0x9c,0x95,
+-			     0x05,0x90,0x3e,0x9b,0xd3,0x3d,0xee,0xcb,
+-			     0x03,0xfc,0xb7,0x02,0x4e,0x89,0x8d,0xfe,
+-			     0x02,0x21,0x00,0xf7,0x84,0xd3,0x66,0xb7,
+-			     0xd3,0xff,0x7b,0x37,0xcf,0xa9,0x7c,0xc5,
+-			     0x9a,0x02,0x8f,0xa7,0xd1,0xc7,0x0d,0x6f,
+-			     0x4e,0x97,0x14,0x0d,0xd1,0x66,0x2b,0x99,
+-			     0xa7,0xee,0xfc};
++	uint8_t cert[434] = { 0x30,0x82,0x01,0xae,0x30,0x82,0x01,0x53,
++			      0xa0,0x03,0x02,0x01,0x02,0x02,0x01,0x01,
++			      0x30,0x0a,0x06,0x08,0x2a,0x86,0x48,0xce,
++			      0x3d,0x04,0x03,0x02,0x30,0x24,0x31,0x0c,
++			      0x30,0x0a,0x06,0x03,0x55,0x04,0x03,0x0c,
++			      0x03,0x54,0x46,0x41,0x31,0x14,0x30,0x12,
++			      0x06,0x03,0x55,0x04,0x0a,0x0c,0x0b,0x43,
++			      0x43,0x41,0x5f,0x4d,0x61,0x63,0x68,0x69,
++			      0x6e,0x65,0x30,0x20,0x17,0x0d,0x32,0x34,
++			      0x30,0x31,0x30,0x31,0x30,0x30,0x30,0x30,
++			      0x30,0x30,0x5a,0x18,0x0f,0x32,0x30,0x39,
++			      0x39,0x31,0x32,0x33,0x31,0x32,0x33,0x35,
++			      0x39,0x35,0x39,0x5a,0x30,0x24,0x31,0x0c,
++			      0x30,0x0a,0x06,0x03,0x55,0x04,0x03,0x0c,
++			      0x03,0x54,0x46,0x41,0x31,0x14,0x30,0x12,
++			      0x06,0x03,0x55,0x04,0x0a,0x0c,0x0b,0x43,
++			      0x43,0x41,0x5f,0x4d,0x61,0x63,0x68,0x69,
++			      0x6e,0x65,0x30,0x59,0x30,0x13,0x06,0x07,
++			      0x2a,0x86,0x48,0xce,0x3d,0x02,0x01,0x06,
++			      0x08,0x2a,0x86,0x48,0xce,0x3d,0x03,0x01,
++			      0x07,0x03,0x42,0x00,0x04,0xb5,0x2d,0x7a,
++			      0x71,0x8a,0x3e,0x55,0x0f,0xc4,0xbd,0x10,
++			      0x18,0xfc,0x20,0x33,0x5f,0xd1,0xe5,0x7b,
++			      0xd3,0x3b,0x87,0x45,0x0c,0x2d,0x24,0x82,
++			      0xa8,0x49,0xeb,0xc5,0x06,0x39,0x0a,0xcb,
++			      0xc2,0xdf,0x4c,0x74,0x21,0xde,0x77,0x3e,
++			      0x42,0x76,0x3f,0xa2,0x8b,0xcc,0xde,0x02,
++			      0xc3,0x16,0xf2,0xe9,0x9c,0xb2,0x23,0x44,
++			      0x55,0xaa,0xd5,0x4b,0x23,0xa3,0x74,0x30,
++			      0x72,0x30,0x12,0x06,0x03,0x55,0x1d,0x13,
++			      0x01,0x01,0xff,0x04,0x08,0x30,0x06,0x01,
++			      0x01,0xff,0x02,0x01,0x02,0x30,0x0e,0x06,
++			      0x03,0x55,0x1d,0x0f,0x01,0x01,0xff,0x04,
++			      0x04,0x03,0x02,0x02,0x04,0x30,0x1d,0x06,
++			      0x03,0x55,0x1d,0x0e,0x04,0x16,0x04,0x14,
++			      0x6d,0xe0,0x7f,0x07,0x5d,0x77,0x0b,0x98,
++			      0x83,0x93,0x49,0x6a,0x88,0xd9,0x59,0x38,
++			      0x36,0x0c,0xc1,0x0e,0x30,0x1f,0x06,0x03,
++			      0x55,0x1d,0x23,0x04,0x18,0x30,0x16,0x80,
++			      0x14,0x6d,0xe0,0x7f,0x07,0x5d,0x77,0x0b,
++			      0x98,0x83,0x93,0x49,0x6a,0x88,0xd9,0x59,
++			      0x38,0x36,0x0c,0xc1,0x0e,0x30,0x0c,0x06,
++			      0x06,0x67,0x81,0x05,0x05,0x04,0x01,0x04,
++			      0x02,0x30,0x00,0x30,0x0a,0x06,0x08,0x2a,
++			      0x86,0x48,0xce,0x3d,0x04,0x03,0x02,0x03,
++			      0x49,0x00,0x30,0x46,0x02,0x21,0x00,0xf0,
++			      0xb5,0xd6,0xc9,0x91,0xd1,0xee,0x02,0x7f,
++			      0xc0,0x4d,0xc9,0xf8,0x5f,0x1d,0x93,0x2d,
++			      0x54,0x83,0x09,0xb2,0x66,0x65,0xc7,0xda,
++			      0x43,0xb4,0x2b,0x25,0x25,0xb6,0x92,0x02,
++			      0x21,0x00,0x90,0xdd,0x5d,0x97,0xce,0x68,
++			      0x60,0xa4,0x9b,0x7b,0xb1,0xf9,0x9b,0x1d,
++			      0x86,0x57,0x42,0xe8,0x38,0x96,0x42,0x0c,
++			      0x16,0x7f,0x58,0x65,0x66,0x59,0xea,0xbe,
++			      0x7e,0x79};
+ 
+-	if (out_size < 355) return -1;
++	if (out_size < 434) return -1;
+ 
+-	*out_len = 355;
++	*out_len = 434;
+ 	memcpy(out, cert, *out_len);
+ 	return 0;
+ }
+diff --git a/include/drivers/auth/crypto_mod.h b/include/drivers/auth/crypto_mod.h
+index 19413d23a..ae13a4ab4 100644
+--- a/include/drivers/auth/crypto_mod.h
++++ b/include/drivers/auth/crypto_mod.h
+@@ -92,7 +92,8 @@ typedef struct crypto_lib_desc_s {
+ 					 const char *subject_name,
+ 					 const char *issuer_name,
+ 					 uint8_t *out_der, size_t max_out_size,
+-					 size_t *cert_len);
++					 size_t *cert_len,
++					 uint8_t *fw_tci, size_t fw_tci_len);
+ 
+ 	int (*import_keypair)(uint8_t *key, size_t key_len,
+ 			      uint32_t *key_id);
+@@ -160,7 +161,8 @@ int crypto_mod_generate_dice_certificate(uint32_t subject_key_id,
+ 					 const char *subject_name,
+ 					 const char *issuer_name,
+ 					 uint8_t *out_der, size_t max_out_size,
+-					 size_t *cert_len);
++					 size_t *cert_len,
++					 uint8_t *fw_tci, size_t fw_tci_len);
+ int crypto_mod_import_keypair(uint8_t *key, size_t key_len,
+ 			      uint32_t *key_id);
+ #endif /* defined(DICE_LAYERING) && defined(IMAGE_BL31) */
+diff --git a/include/drivers/dice_layering/dice_layering.h b/include/drivers/dice_layering/dice_layering.h
+index 5b240743f..2cbf562b5 100644
+--- a/include/drivers/dice_layering/dice_layering.h
++++ b/include/drivers/dice_layering/dice_layering.h
+@@ -8,7 +8,7 @@
+ #define TCI_LEN      U(32)
+ #define SEC_KEY_LEN  U(32)
+ #define SEED_LEN     (CDI_LEN + TCI_LEN)
+-#define CERT_MAX_LEN U(512)
++#define CERT_MAX_LEN U(1024)
+ 
+ /*
+  * Data structure with the dice layering objects that must be passed
+@@ -18,19 +18,19 @@ struct dice_manifest_data {
+ 	/*
+ 	 * The CDI is computed as HKDF(CDI(TFA) || TCI(RMM))
+ 	 */
+-	uint8_t cdi_rmm[32];
++	uint8_t cdi_rmm[CDI_LEN];
+ 	/*
+ 	 * Certificate of the RAK public key. The RAK is deterministically generated
+ 	 * from the cdi_rmm. So, the RMM can re-derive it. The usage of a different
+ 	 * key can be detected from the verifier since the entire CoT must is sent.
+ 	 */
+-	uint8_t cert_rak[400];
++	uint8_t cert_rak[CERT_MAX_LEN];
+ 	size_t cert_rak_len;
+ 	/*
+ 	 * Certificate of the TFA public key. This is the parent of the
+ 	 * RAK certificate in the CoT.
+ 	 */
+-	uint8_t cert_tfa[400];
++	uint8_t cert_tfa[CERT_MAX_LEN];
+ 	size_t cert_tfa_len;
+ };
+ 
+diff --git a/services/std_svc/rmmd/rmmd_main.c b/services/std_svc/rmmd/rmmd_main.c
+index 0ccee18a1..b7802e4ed 100644
+--- a/services/std_svc/rmmd/rmmd_main.c
++++ b/services/std_svc/rmmd/rmmd_main.c
+@@ -265,7 +265,7 @@ int rmmd_setup(void)
+ 	assert((shared_buf_size == SZ_4K) &&
+ 					((void *)shared_buf_base != NULL));
+ 
+-#ifdef DICE_LAYERING
++#if DICE_LAYERING
+ 	dice_layering_prepare_rmm_data();
+ #endif /* DICE_LAYERING */
+ 
+-- 
+2.54.0
+

@@ -1,0 +1,72 @@
+From c1736999b727d53dca0cc1f5e725355487e53ee0 Mon Sep 17 00:00:00 2001
+From: Antonio Di Ponzio <antoniodiponzio@protonmail.com>
+Date: Mon, 31 Aug 2026 17:55:43 +0200
+Subject: [PATCH] feat: added cca_dice_demo package
+
+---
+ Config.in                              |  1 +
+ configs/cca_defconfig                  |  1 +
+ package/cca-dice-demo/Config.in        |  5 +++++
+ package/cca-dice-demo/cca-dice-demo.mk | 17 +++++++++++++++++
+ 4 files changed, 24 insertions(+)
+ create mode 100644 package/cca-dice-demo/Config.in
+ create mode 100644 package/cca-dice-demo/cca-dice-demo.mk
+
+diff --git a/Config.in b/Config.in
+index aa073dc..cdabfa1 100644
+--- a/Config.in
++++ b/Config.in
+@@ -3,3 +3,4 @@ source "$BR2_EXTERNAL_LINARO_CCA_PATH/package/cca-workload-attestation/Config.in
+ source "$BR2_EXTERNAL_LINARO_CCA_PATH/package/keybroker-demo/Config.in"
+ source "$BR2_EXTERNAL_LINARO_CCA_PATH/package/qemu-cca/Config.in"
+ source "$BR2_EXTERNAL_LINARO_CCA_PATH/package/kvmtool-cca/Config.in"
++source "$BR2_EXTERNAL_LINARO_CCA_PATH/package/cca-dice-demo/Config.in"
+diff --git a/configs/cca_defconfig b/configs/cca_defconfig
+index 2801490..35c9359 100644
+--- a/configs/cca_defconfig
++++ b/configs/cca_defconfig
+@@ -35,6 +35,7 @@ BR2_PACKAGE_QEMU_CCA_TRACING=y
+ BR2_PACKAGE_CCA_REALM_MEASUREMENTS=y
+ BR2_PACKAGE_CCA_WORKLOAD_ATTESTATION=y
+ BR2_PACKAGE_KEYBROKER_DEMO=y
++BR2_PACKAGE_CCA_DICE_DEMO=y
+ 
+ BR2_ROOTFS_POST_BUILD_SCRIPT="$(BR2_EXTERNAL_LINARO_CCA_PATH)/scripts/post-build.sh"
+ 
+diff --git a/package/cca-dice-demo/Config.in b/package/cca-dice-demo/Config.in
+new file mode 100644
+index 0000000..2703960
+--- /dev/null
++++ b/package/cca-dice-demo/Config.in
+@@ -0,0 +1,5 @@
++config BR2_PACKAGE_CCA_DICE_DEMO
++    bool "cca-dice-demo"
++    #depends on BR2_LINUX_KERNEL
++    help
++      Userspace application to interact with the Realm kernel module.
+diff --git a/package/cca-dice-demo/cca-dice-demo.mk b/package/cca-dice-demo/cca-dice-demo.mk
+new file mode 100644
+index 0000000..c2a58d5
+--- /dev/null
++++ b/package/cca-dice-demo/cca-dice-demo.mk
+@@ -0,0 +1,17 @@
++# Use a specific commit hash, tag, or branch name (e.g., main or master)
++CCA_DICE_DEMO_VERSION = main 
++CCA_DICE_DEMO_SITE = https://github.com/adiponzio/cca_dice_demo.git
++CCA_DICE_DEMO_SITE_METHOD = git
++
++# Pass Buildroot's ARM64 cross-compiler flags to the downloaded Makefile
++define CCA_DICE_DEMO_BUILD_CMDS
++    $(MAKE) $(TARGET_CONFIGURE_OPTS) \
++		-C $(@D) all
++endef
++
++# Install the compiled binary into the target root filesystem's /usr/bin
++define CCA_DICE_DEMO_INSTALL_TARGET_CMDS
++    $(INSTALL) -D -m 0755 $(@D)/cca_dice_demo $(TARGET_DIR)/usr/bin/cca_dice_demo
++endef
++
++$(eval $(generic-package))
+-- 
+2.54.0
+

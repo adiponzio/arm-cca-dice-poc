@@ -1,0 +1,11 @@
+%YAML 1.2
+---
+description: >-
+  Set the debug flag for qemu so that it waits for a remote debugger.
+
+run:
+  runners:
+    QEMU:
+      params:
+        - -s
+        - -S

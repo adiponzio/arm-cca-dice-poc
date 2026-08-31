@@ -1,0 +1,416 @@
+From 3708333e70fe36bfb812cff75dcbca5a022fc122 Mon Sep 17 00:00:00 2001
+From: Antonio Di Ponzio <antoniodiponzio@protonmail.com>
+Date: Mon, 31 Aug 2026 15:30:41 +0200
+Subject: [PATCH 3/3] fix: fixed certificates generation adding DICE profile
+ constraints
+
+---
+ .../el0_app/src/dice_layering_app.c           |  10 +-
+ .../el0_app/src/dice_layering_crypto.c        | 183 +++++++++++++++++-
+ .../el0_app/src/dice_layering_crypto.h        |   3 +-
+ .../rmm_stub/include/dice_layering_defs.h     |  12 +-
+ lib/rmm_el3_ifc/include/rmm_el3_ifc.h         |  10 +-
+ runtime/rmi/realm.c                           |   2 +-
+ runtime/rsi/realm_dice_operations.c           |   3 +-
+ 7 files changed, 206 insertions(+), 17 deletions(-)
+
+diff --git a/app/dice_layering/el0_app/src/dice_layering_app.c b/app/dice_layering/el0_app/src/dice_layering_app.c
+index f51f829..d73456f 100644
+--- a/app/dice_layering/el0_app/src/dice_layering_app.c
++++ b/app/dice_layering/el0_app/src/dice_layering_app.c
+@@ -271,6 +271,7 @@ static int dice_layering_init_realm_crypto()
+ 	struct dice_realm_data dice_realm;
+ 	struct crypto_identity output = {0};
+ 	psa_key_id_t rak_id, rik_id;
++	size_t rim_len;
+ 
+ 	struct dice_layering_heap_t *heap = (struct dice_layering_heap_t *)get_heap_start();
+ 
+@@ -298,6 +299,9 @@ static int dice_layering_init_realm_crypto()
+ 		goto cleanup;
+ 	}
+ 
++	/* Select the appropriate RIM lenght according to the hash algorithm. */
++	rim_len = (dice_realm.algorithm == HASH_SHA_256) ? 32 : 64;
++
+ 	/*
+ 	 * Finally generate the public key certificates for both the RIK and RAK
+ 	 */
+@@ -305,7 +309,8 @@ static int dice_layering_init_realm_crypto()
+ 					"CN=Realm,O=CCA_Machine",
+ 					"CN=RMM,O=CCA_Machine",
+ 					output.rak_cert, sizeof(output.rak_cert),
+-					&output.rak_cert_len);
++					&output.rak_cert_len,
++					dice_realm.rim, rim_len);
+ 	if (ret != 0) {
+ 		goto cleanup;
+ 	}
+@@ -314,7 +319,8 @@ static int dice_layering_init_realm_crypto()
+ 					"CN=Realm,O=CCA_Machine",
+ 					"CN=RMM,O=CCA_Machine",
+ 					output.rik_cert, sizeof(output.rik_cert),
+-					&output.rik_cert_len);
++					&output.rik_cert_len,
++					dice_realm.rim, rim_len);
+ 	if (ret != 0) {
+ 		goto cleanup;
+ 	}
+diff --git a/app/dice_layering/el0_app/src/dice_layering_crypto.c b/app/dice_layering/el0_app/src/dice_layering_crypto.c
+index 031b0ef..e1ce4df 100644
+--- a/app/dice_layering/el0_app/src/dice_layering_crypto.c
++++ b/app/dice_layering/el0_app/src/dice_layering_crypto.c
+@@ -3,6 +3,8 @@
+ #include <mbedtls/pk.h>
+ #include <mbedtls/x509_crt.h>
+ #include <mbedtls/x509.h>
++#include <mbedtls/asn1write.h>
++#include <mbedtls/oid.h>
+ #include <string.h>
+ #include <debug.h>
+ 
+@@ -293,12 +295,152 @@ end:
+ 	return status;
+ }
+ 
++static int add_key_identifiers(mbedtls_x509write_cert *crt,
++			       mbedtls_pk_context *subject_pk,
++			       mbedtls_pk_context *issuer_pk)
++{
++	int ret;
++	unsigned char pub_buf[256];
++	unsigned char hash[32];
++	size_t hash_len;
++	unsigned char ext_buf[64];
++	unsigned char *p;
++	size_t ext_len;
++
++	/* Subject Key Identifier (SKID) */
++	ret = mbedtls_pk_write_pubkey_der(subject_pk, pub_buf, sizeof(pub_buf));
++	if (ret < 0) return ret;
++
++	if (psa_hash_compute(PSA_ALG_SHA_256,
++			     pub_buf + sizeof(pub_buf) - ret, ret,
++			     hash, sizeof(hash), &hash_len) != PSA_SUCCESS) {
++		return -1;
++	}
++
++	ext_len = 0;
++	p = ext_buf + sizeof(ext_buf);
++
++	/* SKID is a standard ASN.1 OCTET STRING */
++	ret = mbedtls_asn1_write_octet_string(&p, ext_buf, hash, 20);
++	if (ret < 0) return ret;
++	ext_len += ret;
++
++	ret = mbedtls_x509write_crt_set_extension(crt, "\x55\x1D\x0E", 3, 0, p, ext_len);
++	if (ret != 0) return ret;
++
++
++	/* Authority Key Identifier (AKID) */
++	ret = mbedtls_pk_write_pubkey_der(issuer_pk, pub_buf, sizeof(pub_buf));
++	if (ret < 0) return ret;
++
++	if (psa_hash_compute(PSA_ALG_SHA_256,
++			     pub_buf + sizeof(pub_buf) - ret, ret,
++			     hash, sizeof(hash), &hash_len) != PSA_SUCCESS) {
++		return -1;
++	}
++
++	ext_len = 0;
++	p = ext_buf + sizeof(ext_buf);
++
++	/* AKID is a SEQUENCE containing an IMPLICIT [0] KeyIdentifier */
++	ret = mbedtls_asn1_write_octet_string(&p, ext_buf, hash, 20);
++	if (ret < 0) return ret;
++	/* Overwrite standard OCTET STRING tag (0x04) with context-specific [0] (0x80) */
++	*p = MBEDTLS_ASN1_CONTEXT_SPECIFIC | 0;
++	ext_len += ret;
++
++	ret = mbedtls_asn1_write_len(&p, ext_buf, ext_len);
++	if (ret < 0) return ret;
++	ext_len += ret;
++
++	ret = mbedtls_asn1_write_tag(&p, ext_buf,
++				     MBEDTLS_ASN1_CONSTRUCTED | MBEDTLS_ASN1_SEQUENCE);
++	if (ret < 0) return ret;
++	ext_len += ret;
++
++	ret = mbedtls_x509write_crt_set_extension(crt, "\x55\x1D\x23", 3, 0, p, ext_len);
++	return ret;
++}
++
++/*
++ * Builds a DICE TCB Info ASN.1 DER payload containing ONLY the fwid.
++ */
++static int build_fwid_only_tcb_info(unsigned char *buf, size_t buf_size,
++				    const unsigned char *fw_hash, size_t fw_hash_len)
++{
++	int ret;
++	size_t len = 0;
++
++	/* Mbed TLS writes backwards from the end of the buffer */
++	unsigned char *p = buf + buf_size;
++	unsigned char *start = buf;
++
++	/* [6] IMPLICIT SEQUENCE OF FWID: fwids */
++	size_t fwid_len = 0;
++
++	/* Write digest */
++	ret = mbedtls_asn1_write_octet_string(&p, start, fw_hash, fw_hash_len);
++	if (ret < 0) return ret;
++	fwid_len += ret;
++
++	/* Write hashAlg (OID) SHA256 */
++	switch (fw_hash_len) {
++	case 32: /*SHA256*/
++		ret = mbedtls_asn1_write_oid(&p, start,
++					     MBEDTLS_OID_DIGEST_ALG_SHA256,
++					     sizeof(MBEDTLS_OID_DIGEST_ALG_SHA256) - 1);
++		break;
++	case 64: /*SHA512*/
++		ret = mbedtls_asn1_write_oid(&p, start,
++					     MBEDTLS_OID_DIGEST_ALG_SHA512,
++					     sizeof(MBEDTLS_OID_DIGEST_ALG_SHA512) - 1);
++		break;
++	}
++
++	if (ret < 0) return ret;
++	fwid_len += ret;
++
++	/* Wrap in standard SEQUENCE tag (0x30) for the single FWID item */
++	ret = mbedtls_asn1_write_len(&p, start, fwid_len);
++	if (ret < 0) return ret;
++	fwid_len += ret;
++	ret = mbedtls_asn1_write_tag(&p, start,
++				     MBEDTLS_ASN1_CONSTRUCTED | MBEDTLS_ASN1_SEQUENCE);
++	if (ret < 0) return ret;
++	fwid_len += ret;
++
++	/* 4. Wrap in IMPLICIT [6] tag (0xA6 = CONSTRUCTED | CONTEXT_SPECIFIC | 6) */
++	ret = mbedtls_asn1_write_len(&p, start, fwid_len);
++	if (ret < 0) return ret;
++	len += fwid_len + ret;
++
++	ret = mbedtls_asn1_write_tag(&p, start,
++				     MBEDTLS_ASN1_CONTEXT_SPECIFIC | MBEDTLS_ASN1_CONSTRUCTED | 6);
++	if (ret < 0) return ret;
++	len += ret;
++
++	/* Wrap everything in the master DiceTcbInfo SEQUENCE (0x30) */
++	ret = mbedtls_asn1_write_len(&p, start, len);
++	if (ret < 0) return ret;
++	len += ret;
++
++	ret = mbedtls_asn1_write_tag(&p, start,
++				     MBEDTLS_ASN1_CONSTRUCTED | MBEDTLS_ASN1_SEQUENCE);
++	if (ret < 0) return ret;
++	len += ret;
++
++	memmove(buf, p, len);
++
++	return (int)len;
++}
++
+ int generate_dice_certificate(psa_key_id_t subject_key_id,
+ 			      psa_key_id_t issuer_key_id,
+ 			      const char *subject_name,
+ 			      const char *issuer_name,
+ 			      uint8_t *out_der, size_t max_out_size,
+-			      size_t *cert_len)
++			      size_t *cert_len,
++			      uint8_t *rim, size_t rim_len)
+ {
+ 	int ret;
+ 	mbedtls_pk_context subject_pk;
+@@ -306,6 +448,11 @@ int generate_dice_certificate(psa_key_id_t subject_key_id,
+ 	mbedtls_x509write_cert crt;
+ 	mbedtls_mpi serial;
+ 
++	unsigned char tcb_info[128];
++	size_t tcb_info_len;
++
++	unsigned char serial_bytes[8];
++
+ 	/* Standard RNG context needed by the X.509 module for internal formatting */
+ 	//mbedtls_ctr_drbg_context ctr_drbg;
+ 	//mbedtls_entropy_context entropy;
+@@ -350,7 +497,20 @@ int generate_dice_certificate(psa_key_id_t subject_key_id,
+ 	ret = mbedtls_x509write_crt_set_validity(&crt, "20240101000000", "20991231235959");
+ 	if (ret != 0) goto cleanup;
+ 
+-	mbedtls_mpi_lset(&serial, 1);
++	///* Generate a random serial number */
++	if (psa_generate_random(serial_bytes, sizeof(serial_bytes)) != PSA_SUCCESS) {
++		ret = -1;
++		goto cleanup;
++	}
++
++	/* Ensure that the generated number is non negative */
++	serial_bytes[0] &= 0x7F;
++
++	ret = mbedtls_mpi_read_binary(&serial, serial_bytes, sizeof(serial_bytes));
++	if (ret != 0) goto cleanup;
++
++	//mbedtls_mpi_lset(&serial, 1);
++
+ 	ret = mbedtls_x509write_crt_set_serial(&crt, &serial);
+ 	if (ret != 0) goto cleanup;
+ 
+@@ -361,9 +521,26 @@ int generate_dice_certificate(psa_key_id_t subject_key_id,
+ 	ret = mbedtls_x509write_crt_set_basic_constraints(&crt, 0, 0);
+ 	if (ret != 0) goto cleanup;
+ 
+-	ret = mbedtls_x509write_crt_set_key_usage(&crt, MBEDTLS_X509_KU_KEY_CERT_SIGN);
++	ret = mbedtls_x509write_crt_set_key_usage(&crt, MBEDTLS_X509_KU_DIGITAL_SIGNATURE);
+ 	if (ret != 0) goto cleanup;
+ 
++	ret = add_key_identifiers(&crt, &subject_pk, &issuer_pk);
++	if (ret != 0) goto cleanup;
++
++	ret = build_fwid_only_tcb_info(tcb_info, sizeof(tcb_info),
++				       rim, rim_len);
++	(void)rim_len;
++	tcb_info_len = (size_t)ret;
++
++	if (ret < 0) goto cleanup;
++
++	tcb_info_len = (size_t)ret;
++	ret = mbedtls_x509write_crt_set_extension(&crt,
++                                                  "\x67\x81\x05\x05\x04\x01", 6,
++                                                  0, /* Non-critical */
++                                                  tcb_info, tcb_info_len);
++        if (ret != 0) goto cleanup;
++
+ 	/* clean the memory for the certificate */
+ 	memset(out_der, 0, max_out_size);
+ 
+diff --git a/app/dice_layering/el0_app/src/dice_layering_crypto.h b/app/dice_layering/el0_app/src/dice_layering_crypto.h
+index 623290b..c2755f0 100644
+--- a/app/dice_layering/el0_app/src/dice_layering_crypto.h
++++ b/app/dice_layering/el0_app/src/dice_layering_crypto.h
+@@ -20,7 +20,8 @@ int generate_dice_certificate(psa_key_id_t subject_key_id,
+ 			      const char *subject_name,
+ 			      const char *issuer_name,
+ 			      uint8_t *out_der, size_t max_out_size,
+-			      size_t *cert_len);
++			      size_t *cert_len,
++			      uint8_t *rim, size_t rim_len);
+ 
+ int sign_payload_deterministic_ecdsa(const uint8_t *priv_key, size_t priv_key_len,
+                                      const uint8_t *payload_hash, size_t hash_len,
+diff --git a/app/dice_layering/rmm_stub/include/dice_layering_defs.h b/app/dice_layering/rmm_stub/include/dice_layering_defs.h
+index ddf0383..7a708e6 100644
+--- a/app/dice_layering/rmm_stub/include/dice_layering_defs.h
++++ b/app/dice_layering/rmm_stub/include/dice_layering_defs.h
+@@ -10,7 +10,7 @@
+ #define DICE_LAYERING_APP_FUNC_GET_CERT 4
+ 
+ #define ECDSA_KEY_LEN 32U /*bytes*/
+-#define MAX_CERT_LEN 400U
++#define MAX_CERT_LEN 1024U
+ #define CDI_LEN 32U
+ 
+ #define MAX_PAYLOAD_LEN 64
+@@ -23,27 +23,27 @@
+  * file of the tfa repository.
+  */
+ struct dice_rmm_data {
+-	uint8_t cdi_rmm[32];
++	uint8_t cdi_rmm[CDI_LEN];
+ 	/*
+ 	 * Certificate of the RAK public key. The RAK is deterministically generated
+ 	 * from the cdi_rmm. So, the RMM can re-derive it. The usage of a different
+ 	 * key can be detected from the verifier since the entire CoT must be sent.
+ 	 */
+-	uint8_t cert_rmm[400];
++	uint8_t cert_rmm[MAX_CERT_LEN];
+ 	size_t cert_rmm_len;
+ 	/*
+ 	 * Certificate of the TFA public key. This is the parent of the
+ 	 * RAK certificate in the CoT.
+ 	 */
+-	uint8_t cert_tfa[400];
++	uint8_t cert_tfa[MAX_CERT_LEN];
+ 	size_t cert_tfa_len;
+ };
+ 
+ struct cert_chain {
+-	uint8_t cert_rmm[400];
++	uint8_t cert_rmm[MAX_CERT_LEN];
+ 	size_t cert_rmm_len;
+ 
+-	uint8_t cert_tfa[400];
++	uint8_t cert_tfa[MAX_CERT_LEN];
+ 	size_t cert_tfa_len;
+ };
+ 
+diff --git a/lib/rmm_el3_ifc/include/rmm_el3_ifc.h b/lib/rmm_el3_ifc/include/rmm_el3_ifc.h
+index 3644d37..de29228 100644
+--- a/lib/rmm_el3_ifc/include/rmm_el3_ifc.h
++++ b/lib/rmm_el3_ifc/include/rmm_el3_ifc.h
+@@ -162,6 +162,10 @@
+ /* The Max Signature is set to be a buffer of 512 Bytes (4096 bits) */
+ #define EL3_TOKEN_RESPONSE_MAX_SIG_LEN			512
+ 
++/* DICE data */
++#define CDI_LEN_IFC U(32)
++#define MAX_CERT_LEN_IFC U(1024)
++
+ /* Structure format in which EL3 expects a request */
+ struct el3_token_sign_request {
+ 	SET_MEMBER(uint32_t sign_alg_id, 0x0, 0x8);
+@@ -389,19 +393,19 @@ int rmm_el3_ifc_get_dev_range_validated_pa(unsigned long max_num_banks,
+ int rmm_el3_ifc_get_plat_data_from_manifest();
+ 
+ struct dice_manifest_data {
+-	uint8_t cdi_rmm[32];
++	uint8_t cdi_rmm[CDI_LEN_IFC];
+ 	/*
+ 	 * Certificate of the RAK public key. The RAK is deterministically generated
+ 	 * from the cdi_rmm. So, the RMM can re-derive it. The usage of a different
+ 	 * key can be detected from the verifier since the entire CoT must be sent.
+ 	 */
+-	uint8_t cert_rmm[400];
++	uint8_t cert_rmm[MAX_CERT_LEN_IFC];
+ 	size_t cert_rmm_len;
+ 	/*
+ 	 * Certificate of the TFA public key. This is the parent of the
+ 	 * RAK certificate in the CoT.
+ 	 */
+-	uint8_t cert_tfa[400];
++	uint8_t cert_tfa[MAX_CERT_LEN_IFC];
+ 	size_t cert_tfa_len;
+ };
+ /****************************************************************************
+diff --git a/runtime/rmi/realm.c b/runtime/rmi/realm.c
+index bf3649d..2b5536c 100644
+--- a/runtime/rmi/realm.c
++++ b/runtime/rmi/realm.c
+@@ -60,7 +60,7 @@ unsigned long smc_realm_activate(unsigned long rd_addr)
+ 	unsigned long end_ticks, freq;
+ 	end_ticks = read_cntpct_el0();
+ 	freq = read_cntfrq_el0();
+-	NOTICE("RMM_PERF_START: end=%lu, freq=%lu\n", end_ticks, freq);
++	NOTICE("RMM_PERF_END: end=%lu, freq=%lu\n", end_ticks, freq);
+ #endif
+ 
+ 	return ret;
+diff --git a/runtime/rsi/realm_dice_operations.c b/runtime/rsi/realm_dice_operations.c
+index 811545a..ccef1fd 100644
+--- a/runtime/rsi/realm_dice_operations.c
++++ b/runtime/rsi/realm_dice_operations.c
+@@ -72,8 +72,9 @@ void handle_rsi_dice_crypto(struct rec *rec, struct rsi_result *res)
+ 	struct crypto_identity dice_id;
+ 
+ 	uint8_t input_buf[MAX_PAYLOAD_LEN];
+-	uint8_t output_buf[1024];
++	uint8_t output_buf[2500];
+ 	size_t output_len;
++
+ 	/*
+ 	 * Map the input and output pages
+ 	 */
+-- 
+2.54.0
+

@@ -1,0 +1,108 @@
+From 687c25391255deac689dcd8dfca43f0b8d32094e Mon Sep 17 00:00:00 2001
+From: Antonio Di Ponzio <antoniodiponzio@protonmail.com>
+Date: Mon, 3 Aug 2026 10:40:18 +0200
+Subject: [PATCH 2/3] feat: added performance mesurements
+
+---
+ bl31/bl31.mk                          |  2 ++
+ bl31/bl31_main.c                      | 13 +++++++++++++
+ drivers/dice_layering/dice_layering.c | 25 +++++++++++++++++++++----
+ 3 files changed, 36 insertions(+), 4 deletions(-)
+
+diff --git a/bl31/bl31.mk b/bl31/bl31.mk
+index e39091528..f4b12a99b 100644
+--- a/bl31/bl31.mk
++++ b/bl31/bl31.mk
+@@ -208,3 +208,5 @@ $(eval $(call add_defines,\
+         EL3_EXCEPTION_HANDLING \
+         SDEI_SUPPORT \
+ )))
++
++BL31_CPPFLAGS += -DMEASURE_BL31=1
+diff --git a/bl31/bl31_main.c b/bl31/bl31_main.c
+index a9f89fc30..bd41f2e90 100644
+--- a/bl31/bl31_main.c
++++ b/bl31/bl31_main.c
+@@ -137,6 +137,11 @@ void bl31_main(void)
+ 	PMF_CAPTURE_TIMESTAMP(bl_svc, BL31_ENTRY, PMF_CACHE_MAINT);
+ #endif
+ 
++#if MEASURE_BL31
++	uint64_t start_ticks, end_ticks, diff_ticks, freq;
++	start_ticks = read_cntpct_el0();
++#endif
++
+ #ifdef SUPPORT_UNKNOWN_MPID
+ 	if (unsupported_mpid_flag == 0) {
+ 		NOTICE("Unsupported MPID detected!\n");
+@@ -231,6 +236,14 @@ void bl31_main(void)
+ 	PMF_CAPTURE_TIMESTAMP(bl_svc, BL31_EXIT, PMF_CACHE_MAINT);
+ #endif
+ 
++
++#if MEASURE_BL31
++	end_ticks = read_cntpct_el0();
++	diff_ticks = end_ticks - start_ticks;
++	freq = read_cntfrq_el0();
++	NOTICE("DICE_PERF_BL31: cycles=%lu, freq=%lu\n", diff_ticks, freq);
++#endif
++
+ 	console_flush();
+ 	console_switch_state(CONSOLE_FLAG_RUNTIME);
+ }
+diff --git a/drivers/dice_layering/dice_layering.c b/drivers/dice_layering/dice_layering.c
+index 234f8ae1f..17d46a4cd 100644
+--- a/drivers/dice_layering/dice_layering.c
++++ b/drivers/dice_layering/dice_layering.c
+@@ -138,19 +138,32 @@ void dice_layering_prepare_rmm_data(void)
+ 	/* Feed the vault to generate the CDI value for the RMM */
+ 	rc = crypto_mod_derive_seed(cdi_rmm_seed, cdi_rmm_seed_len,
+ 				    cdi_rmm, CDI_LEN);
+-	assert(rc == 0);
++	//assert(rc == 0);
++	if (rc != 0) {
++		ERROR("DICE layering failed with error: %d\n", rc);
++		panic(); /* Halts the system immediately */
++	}
++
+ 	cdi_rmm_len = CDI_LEN;
+ 	INFO("Derived CDI RMM\n");
+ 
+ 	/* Use the CDI value to generate a key pair */
+ 	rc = crypto_mod_derive_keypair_deterministic(cdi_rmm, cdi_rmm_len,
+ 						     &rmm_key_id);
+-	assert(rc == 0);
++	//assert(rc == 0);
++	if (rc != 0) {
++		ERROR("DICE layering failed with error: %d\n", rc);
++		panic(); /* Halts the system immediately */
++	}
+ 	INFO("Derived RMM key\n");
+ 
+ 	/* Import the hardcoded tfa keypair inside the vault */
+ 	rc = crypto_mod_import_keypair(tfa_seck, tfa_seck_len, &tfa_key_id);
+-	assert(rc == 0);
++	//assert(rc == 0);
++	if (rc != 0) {
++		ERROR("DICE layering failed with error: %d\n", rc);
++		panic(); /* Halts the system immediately */
++	}
+ 	INFO("Imported TFA key\n");
+ 
+ 	/* Generate the certificate signed with the TFA key */
+@@ -159,7 +172,11 @@ void dice_layering_prepare_rmm_data(void)
+ 					     	  "CN=TFA,O=CCA_Machine",
+ 					     	  rmm_cert, sizeof(rmm_cert),
+ 						  &rmm_cert_len);
+-	assert(rc == 0);
++	//assert(rc == 0);
++	if (rc != 0) {
++		ERROR("DICE layering failed with error: %d\n", rc);
++		panic(); /* Halts the system immediately */
++	}
+ 	INFO("Generated RMM cert\n");
+ 
+ 	/* Only for debug purposes. */
+-- 
+2.54.0
+

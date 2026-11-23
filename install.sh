@@ -2,14 +2,9 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-MBEDTLS_DIR="$SCRIPT_DIR/../workspace/source/cca-3world/mbedtls"
 
 echo "[*] Copying custom shrinkwrap configs..."
-cp ./config/* ../shrinkwrap/config/
-
-echo "[*] Setting up mbedtls repository..."
-git clone https://github.com/Mbed-TLS/mbedtls.git "$MBEDTLS_DIR"
-git -C "$MBEDTLS_DIR" checkout v3.6.3
+cp -r ./config/* ../shrinkwrap/config/
 
 echo "[*] Applying DICE patches to TF-A, RMM, Linux, and Buildroot External CCA..."
 

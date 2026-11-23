@@ -1,0 +1,330 @@
+From 7a236b658c66f0d036cc63b971e43367225baf6c Mon Sep 17 00:00:00 2001
+From: Antonio Di Ponzio <antoniodiponzio@protonmail.com>
+Date: Mon, 23 Nov 2026 14:10:23 +0100
+Subject: [PATCH] feat: introduce DICE layering on upstream-v5 version of the
+ RME stack for QEMU
+
+---
+ drivers/virt/coco/Kconfig                     |   2 +
+ drivers/virt/coco/Makefile                    |   1 +
+ drivers/virt/coco/dice-crypto-guest/Kconfig   |  15 ++
+ drivers/virt/coco/dice-crypto-guest/Makefile  |   2 +
+ .../dice-crypto-guest/dice-crypto-guest.c     | 204 ++++++++++++++++++
+ include/uapi/linux/realm_dice_abi.h           |  39 ++++
+ 6 files changed, 263 insertions(+)
+ create mode 100644 drivers/virt/coco/dice-crypto-guest/Kconfig
+ create mode 100644 drivers/virt/coco/dice-crypto-guest/Makefile
+ create mode 100644 drivers/virt/coco/dice-crypto-guest/dice-crypto-guest.c
+ create mode 100644 include/uapi/linux/realm_dice_abi.h
+
+diff --git a/drivers/virt/coco/Kconfig b/drivers/virt/coco/Kconfig
+index f7691f64fbe3..a991a945632c 100644
+--- a/drivers/virt/coco/Kconfig
++++ b/drivers/virt/coco/Kconfig
+@@ -14,6 +14,8 @@ source "drivers/virt/coco/tdx-guest/Kconfig"
+ 
+ source "drivers/virt/coco/arm-cca-guest/Kconfig"
+ 
++source "drivers/virt/coco/dice-crypto-guest/Kconfig"
++
+ source "drivers/virt/coco/guest/Kconfig"
+ endif
+ 
+diff --git a/drivers/virt/coco/Makefile b/drivers/virt/coco/Makefile
+index b323b0ae4f82..5b9f9bf7cf84 100644
+--- a/drivers/virt/coco/Makefile
++++ b/drivers/virt/coco/Makefile
+@@ -8,5 +8,6 @@ obj-$(CONFIG_SEV_GUEST)		+= sev-guest/
+ obj-$(CONFIG_INTEL_TDX_GUEST)	+= tdx-guest/
+ obj-$(CONFIG_INTEL_TDX_HOST)	+= tdx-host/
+ obj-$(CONFIG_ARM_CCA_GUEST)	+= arm-cca-guest/
++obj-$(CONFIG_ARM_CCA_GUEST)	+= dice-crypto-guest/
+ obj-$(CONFIG_TSM) 		+= tsm-core.o
+ obj-$(CONFIG_TSM_GUEST)		+= guest/
+diff --git a/drivers/virt/coco/dice-crypto-guest/Kconfig b/drivers/virt/coco/dice-crypto-guest/Kconfig
+new file mode 100644
+index 000000000000..5969da3def32
+--- /dev/null
++++ b/drivers/virt/coco/dice-crypto-guest/Kconfig
+@@ -0,0 +1,15 @@
++# SPDX-License-Identifier: GPL-2.0-only
++config REALM_DICE
++	tristate "Arm CCA Realm DICE Signing Interface"
++	depends on ARM_CCA_GUEST
++	default ARM_CCA_GUEST
++	help
++	  Provides a character device (/dev/realm_dice) that allows
++	  Realm userspace to request DICE signing and X.509 certificate
++	  export from the RMM via RSI.
++
++	  This requires a modified RMM that supports the custom
++	  SMC_RSI_DICE_CRYPTO SMC call.
++
++	  To compile this driver as a module, choose M here: the module
++	  will be called dice-crypto-guest. If built into the kernel, choose Y.
+diff --git a/drivers/virt/coco/dice-crypto-guest/Makefile b/drivers/virt/coco/dice-crypto-guest/Makefile
+new file mode 100644
+index 000000000000..f83e88b6db22
+--- /dev/null
++++ b/drivers/virt/coco/dice-crypto-guest/Makefile
+@@ -0,0 +1,2 @@
++# SPDX-License-Identifier: GPL-2.0-only
++obj-$(CONFIG_ARM_CCA_GUEST) += dice-crypto-guest.o
+diff --git a/drivers/virt/coco/dice-crypto-guest/dice-crypto-guest.c b/drivers/virt/coco/dice-crypto-guest/dice-crypto-guest.c
+new file mode 100644
+index 000000000000..379b2ffaf9c8
+--- /dev/null
++++ b/drivers/virt/coco/dice-crypto-guest/dice-crypto-guest.c
+@@ -0,0 +1,204 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Arm CCA Realm DICE Signing & Certificate Interface Driver
++ *
++ * Copyright (C) 2026 Antonio Di Ponzio
++ */
++
++#include <linux/arm-smccc.h>
++#include <linux/fs.h>
++#include <linux/gfp.h>
++#include <linux/io.h>
++#include <linux/minmax.h>
++#include <linux/miscdevice.h>
++#include <linux/module.h>
++#include <linux/slab.h>
++#include <linux/string.h>
++#include <linux/uaccess.h>
++#include <uapi/linux/realm_dice_abi.h>
++
++#include <asm/rsi.h>
++
++#define DRIVER_NAME "realm_dice"
++
++/* Custom RSI FID for DICE operations */
++#define RSI_DICE_CRYPTO_FID 0xC40001B0UL
++
++static long realm_dice_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
++{
++	struct realm_dice_req req;
++	struct arm_smccc_res res;
++	size_t actual_out_size = 0;
++	size_t max_user_out_size = 0;
++	size_t rmm_out_size = 0;
++	__u64 target_ptr;
++	phys_addr_t ipa;
++	void *kbuf;
++	long ret = 0;
++
++	switch (cmd) {
++	case REALM_DICE_IOC_SIGN_DSRAK:
++	case REALM_DICE_IOC_SIGN_DSRIK:
++	case REALM_DICE_IOC_GET_CERT_DSRAK:
++	case REALM_DICE_IOC_GET_CERT_DSRIK:
++	case REALM_DICE_IOC_GET_CERT_CHAIN:
++		break;
++	default:
++		return -ENOTTY;
++	}
++
++	if (copy_from_user(&req, (const void __user *)arg, sizeof(req)))
++		return -EFAULT;
++
++	if (cmd == REALM_DICE_IOC_SIGN_DSRAK || cmd == REALM_DICE_IOC_SIGN_DSRIK) {
++		if (req.sign.payload_len == 0 || req.sign.payload_len > PAGE_SIZE ||
++		    req.sign.sig_len == 0)
++			return -EINVAL;
++		max_user_out_size = req.sign.sig_len;
++	} else {
++		if (req.cert.cert_buf_size == 0)
++			return -EINVAL;
++		max_user_out_size = req.cert.cert_buf_size;
++	}
++
++	rmm_out_size = min_t(size_t, max_user_out_size, PAGE_SIZE);
++
++	/* Allocate a page-aligned buffer to ensure clean granule boundaries for RMM */
++	kbuf = (void *)__get_free_page(GFP_KERNEL | __GFP_ZERO);
++	if (!kbuf)
++		return -ENOMEM;
++
++	/* Copy userspace input only for signing operations */
++	if (_IOC_DIR(cmd) & _IOC_WRITE) {
++		if (copy_from_user(kbuf,
++				   (const void __user *)(uintptr_t)req.sign.payload,
++				   req.sign.payload_len)) {
++			ret = -EFAULT;
++			goto out_free;
++		}
++	}
++
++	/* Translate the kernel virtual address to Intermediate Physical Address (IPA) */
++	ipa = virt_to_phys(kbuf);
++
++	/*
++	 * Trap to RMM (R-EL2).
++	 * x0 = FID (RSI_DICE_CRYPTO_FID)
++	 * x1 = Operation ID (RSI_DICE_OP_*)
++	 * x2 = Buffer IPA (4KB Granule aligned)
++	 * x3 = Input payload length
++	 * x4 = Output buffer capacity
++	 */
++	switch (cmd) {
++	case REALM_DICE_IOC_SIGN_DSRAK:
++		arm_smccc_smc(RSI_DICE_CRYPTO_FID, RSI_DICE_OP_SIGN_DSRAK,
++			      ipa, req.sign.payload_len, rmm_out_size,
++			      0, 0, 0, &res);
++		break;
++	case REALM_DICE_IOC_SIGN_DSRIK:
++		arm_smccc_smc(RSI_DICE_CRYPTO_FID, RSI_DICE_OP_SIGN_DSRIK,
++			      ipa, req.sign.payload_len, rmm_out_size,
++			      0, 0, 0, &res);
++		break;
++	case REALM_DICE_IOC_GET_CERT_DSRAK:
++		arm_smccc_smc(RSI_DICE_CRYPTO_FID, RSI_DICE_OP_GET_CERT_DSRAK,
++			      ipa, 0, rmm_out_size,
++			      0, 0, 0, &res);
++		break;
++	case REALM_DICE_IOC_GET_CERT_DSRIK:
++		arm_smccc_smc(RSI_DICE_CRYPTO_FID, RSI_DICE_OP_GET_CERT_DSRIK,
++			      ipa, 0, rmm_out_size,
++			      0, 0, 0, &res);
++		break;
++	case REALM_DICE_IOC_GET_CERT_CHAIN:
++		arm_smccc_smc(RSI_DICE_CRYPTO_FID, RSI_DICE_OP_GET_CERT_CHAIN,
++			      ipa, 0, rmm_out_size,
++			      0, 0, 0, &res);
++		break;
++	default:
++		ret = -ENOTTY;
++		goto out_free;
++	}
++
++	if (res.a0 != 0) {
++		pr_err("%s: RMM DICE operation %u failed with error %lu\n",
++		       DRIVER_NAME, cmd, res.a0);
++		ret = -EIO;
++		goto out_free;
++	}
++
++	actual_out_size = res.a1;
++	if (actual_out_size > rmm_out_size) {
++		ret = -EIO;
++		goto out_free;
++	}
++
++	if (_IOC_DIR(cmd) & _IOC_READ) {
++		if (cmd == REALM_DICE_IOC_SIGN_DSRAK || cmd == REALM_DICE_IOC_SIGN_DSRIK) {
++			target_ptr = req.sign.signature;
++			req.sign.sig_len = actual_out_size;
++		} else {
++			target_ptr = req.cert.cert_buf;
++			req.cert.cert_len = actual_out_size;
++		}
++
++		if (copy_to_user((void __user *)(uintptr_t)target_ptr, kbuf,
++				 actual_out_size)) {
++			ret = -EFAULT;
++			goto out_free;
++		}
++
++		if (copy_to_user((void __user *)arg, &req, sizeof(req))) {
++			ret = -EFAULT;
++			goto out_free;
++		}
++	}
++
++out_free:
++	memzero_explicit(kbuf, PAGE_SIZE);
++	free_page((unsigned long)kbuf);
++	return ret;
++}
++
++static const struct file_operations realm_dice_fops = {
++	.owner          = THIS_MODULE,
++	.unlocked_ioctl = realm_dice_ioctl,
++	.llseek         = noop_llseek,
++};
++
++static struct miscdevice realm_dice_miscdev = {
++	.minor = MISC_DYNAMIC_MINOR,
++	.name  = DRIVER_NAME,
++	.fops  = &realm_dice_fops,
++};
++
++static int __init realm_dice_init(void)
++{
++	int ret;
++
++	if (!is_realm_world())
++		return -ENODEV;
++
++	ret = misc_register(&realm_dice_miscdev);
++	if (ret) {
++		pr_err("%s: Failed to register misc device (ret=%d)\n",
++		       DRIVER_NAME, ret);
++		return ret;
++	}
++
++	pr_info("%s: Registered Arm CCA DICE signing device\n", DRIVER_NAME);
++	return 0;
++}
++
++static void __exit realm_dice_exit(void)
++{
++	misc_deregister(&realm_dice_miscdev);
++	pr_info("%s: Deregistered\n", DRIVER_NAME);
++}
++
++module_init(realm_dice_init);
++module_exit(realm_dice_exit);
++
++MODULE_AUTHOR("Antonio Di Ponzio");
++MODULE_DESCRIPTION("Realm DICE Signing Interface for Arm CCA");
++MODULE_LICENSE("GPL");
+diff --git a/include/uapi/linux/realm_dice_abi.h b/include/uapi/linux/realm_dice_abi.h
+new file mode 100644
+index 000000000000..c8951cd108da
+--- /dev/null
++++ b/include/uapi/linux/realm_dice_abi.h
+@@ -0,0 +1,39 @@
++/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
++#ifndef REALM_DICE_ABI_H
++#define REALM_DICE_ABI_H
++
++#include <linux/ioctl.h>
++#include <linux/types.h>
++
++#define RSI_DICE_OP_SIGN_DSRAK		0
++#define RSI_DICE_OP_SIGN_DSRIK		1
++#define RSI_DICE_OP_GET_CERT_DSRAK	2
++#define RSI_DICE_OP_GET_CERT_DSRIK	3
++#define RSI_DICE_OP_GET_CERT_CHAIN	4
++
++struct realm_dice_req {
++	union {
++		/* Used for REALM_DICE_IOC_SIGN_* */
++		struct {
++			__u64 payload;		/* User pointer to data to sign */
++			__u64 payload_len;
++			__u64 signature;	/* User pointer for output */
++			__u64 sig_len;		/* In: buffer size, Out: actual size */
++		} sign;
++
++		/* Used for REALM_DICE_IOC_GET_CERT_* */
++		struct {
++			__u64 cert_buf;		/* User pointer for output */
++			__u64 cert_buf_size;	/* In: buffer size */
++			__u64 cert_len;		/* Out: actual size */
++		} cert;
++	};
++};
++
++#define REALM_DICE_IOC_SIGN_DSRAK		_IOWR('D', 0, struct realm_dice_req)
++#define REALM_DICE_IOC_SIGN_DSRIK		_IOWR('D', 1, struct realm_dice_req)
++#define REALM_DICE_IOC_GET_CERT_DSRAK	_IOR('D', 2, struct realm_dice_req)
++#define REALM_DICE_IOC_GET_CERT_DSRIK	_IOR('D', 3, struct realm_dice_req)
++#define REALM_DICE_IOC_GET_CERT_CHAIN	_IOR('D', 4, struct realm_dice_req)
++
++#endif /* REALM_DICE_ABI_H */
+-- 
+2.56.0
+

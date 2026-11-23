@@ -36,14 +36,14 @@ pipx install tuxmake
 Create the workspace and clone the CCA Shrinkwrap configuration:
 
 ```bash
-mkdir cca-v10
-cd cca-v10
+mkdir upstream-v5
+cd upstream-v5
 mkdir workspace
 
-git clone https://gitlab.com/Linaro/cca-public/shrinkwrap.git -b cca/v10
+git clone https://gitlab.com/Linaro/cca-public/shrinkwrap.git -b upstream-v5
 ```
 
-Export the required environment variables from the `cca-v10` directory:
+Export the required environment variables from the `upstream-v5` directory:
 
 ```bash
 export PATH=$PWD/shrinkwrap/shrinkwrap:$PATH
@@ -83,22 +83,22 @@ chmod +x install.sh
 The installation script:
 
 - applies the PoC patches to the **RMM**, **TF-A**, **Linux**, and **Buildroot external CCA** repositories;
-- clones **Mbed TLS v3.6.3**;
 - installs the custom Shrinkwrap configuration files required by the PoC.
 
 ## Build
-From the `cca-v10` workspace, build the PoC with:
+From the `upstream-v5` workspace, build the PoC with:
 
 ```bash
 shrinkwrap build cca-3world.yaml \
   --overlay=qemu/cca.yaml \
   --overlay=buildroot-cca.yaml \
-  --overlay=dice_layering.yaml \
-  --overlay=dice_performance_measure.yaml \
+  --overlay=dice_layering/dice_layering.yaml \
+  --overlay=dice_layering/build_release.yaml \
   --no-sync-all
 ```
 
 The `--no-sync-all` option prevents Shrinkwrap from synchronising the repositories at every build.
+To build the debug version, use the `build_debug.yaml` overlay instead of the `build_release.yaml`.
 
 ## Run
 
@@ -109,29 +109,6 @@ shrinkwrap run cca-3world.yaml
 ```
 
 Shrinkwrap runs the emulation in a container by default.
-
-### Using a fixed container image
-
-To keep the same toolchain/runtime between builds and executions, a specific Shrinkwrap image can be selected.
-
-For example:
-
-```bash
-shrinkwrap --image=shrinkwraptool/base-slim:2025.12.0 \
-  build cca-3world.yaml \
-  --overlay=qemu/cca.yaml \
-  --overlay=buildroot-cca.yaml \
-  --overlay=dice_layering.yaml \
-  --overlay=dice_performance_measure.yaml \
-  --no-sync-all
-```
-
-Run using the same image:
-
-```bash
-shrinkwrap --image=shrinkwraptool/base-slim:2025.12.0 \
-  run cca-3world.yaml
-```
 
 ## Using a Realm
 
@@ -146,7 +123,7 @@ gen-run-vmm.sh --tap
 To use `kvmtool` instead of QEMU:
 
 ```bash
-gen-run-vmm.sh --tap --kvmtool
+gen-run-vmm.sh --kvmtool --no-gen-dtb --tap --no-pmu
 ```
 
 After the Realm has booted, log in as `root`.
@@ -163,10 +140,10 @@ Usage:
 Usage: cca_dice_demo <operation>
 
 Available operations:
-sign-rak : Sign payload using RAK
-sign-rik : Sign payload using RIK
-cert-rak : Get RAK public key certificate
-cert-rik : Get RIK public key certificate
+sign-dsrak : Sign payload using RAK
+sign-dsrik : Sign payload using RIK
+cert-dsrak : Get RAK public key certificate
+cert-dsrik : Get RIK public key certificate
 cert-chain : Get machine certificate chain
 ```
 
@@ -178,10 +155,10 @@ The available operations allow you to:
 
 | Operation | Description |
 |---|---|
-| `sign-rak` | Sign a payload using the Realm Attestation Key (RAK). |
-| `sign-rik` | Sign a payload using the Realm Identity Key (RIK). |
-| `cert-rak` | Retrieve the RAK public-key certificate. |
-| `cert-rik` | Retrieve the RIK public-key certificate. |
+| `sign-dsrak` | Sign a payload using the DICE Specific Realm Attestation Key (DSRAK). |
+| `sign-dsrik` | Sign a payload using the DICE Specific Realm Identity Key (DSRIK). |
+| `cert-dsrak` | Retrieve the DSRAK public-key certificate. |
+| `cert-dsrik` | Retrieve the DSRIK public-key certificate. |
 | `cert-chain` | Retrieve the machine certificate chain. |
 
 

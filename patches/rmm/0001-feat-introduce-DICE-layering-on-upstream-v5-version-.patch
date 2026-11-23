@@ -1,0 +1,2399 @@
+From bd7e014576ca926883c16bb90118e84449631133 Mon Sep 17 00:00:00 2001
+From: Antonio Di Ponzio <antoniodiponzio@protonmail.com>
+Date: Mon, 23 Nov 2026 14:09:39 +0100
+Subject: [PATCH] feat: introduce DICE layering on upstream-v5 version of the
+ RME stack for QEMU
+
+---
+ CMakeLists.txt                                |   4 +-
+ app/CMakeLists.txt                            |   1 +
+ app/common/framework/include/app.h            |   1 +
+ app/common/framework/include/app_header.h     |   2 +-
+ app/common/framework/src/aarch64/app.c        |   5 +
+ app/dice_layering/CMakeLists.txt              |   9 +
+ app/dice_layering/el0_app/CMakeLists.txt      |  53 ++
+ .../mbedtls_dice_layering/CMakeLists.txt      |  47 ++
+ .../rmm_mbedtls_config_dice_layering.h        |  83 +++
+ .../el0_app/src/dice_layering_app.c           | 430 ++++++++++++
+ .../el0_app/src/dice_layering_app.h           |  24 +
+ .../el0_app/src/dice_layering_crypto.c        | 617 ++++++++++++++++++
+ .../el0_app/src/dice_layering_crypto.h        |  34 +
+ app/dice_layering/rmm_stub/CMakeLists.txt     |  28 +
+ .../rmm_stub/include/dice_layering_app.h      |  29 +
+ .../rmm_stub/include/dice_layering_defs.h     |  58 ++
+ .../src/app_support/dice_layering_app.c       | 247 +++++++
+ lib/rmm_el3_ifc/include/rmm_el3_ifc.h         |  18 +
+ lib/rmm_el3_ifc/src/rmm_el3_ifc_manifest.c    |  44 +-
+ lib/smc/include/smc-rsi.h                     |  19 +
+ runtime/CMakeLists.txt                        |   1 +
+ runtime/core/exit.c                           |  13 +-
+ runtime/core/handler.c                        |   3 +-
+ runtime/core/init.c                           |  17 +-
+ runtime/include/realm.h                       |   4 +
+ runtime/include/rsi-handler.h                 |   1 +
+ runtime/rmi/realm.c                           |  21 +
+ runtime/rsi/logger.c                          |   7 +-
+ runtime/rsi/realm_dice_operations.c           | 164 +++++
+ 29 files changed, 1971 insertions(+), 13 deletions(-)
+ create mode 100644 app/dice_layering/CMakeLists.txt
+ create mode 100644 app/dice_layering/el0_app/CMakeLists.txt
+ create mode 100644 app/dice_layering/el0_app/mbedtls_dice_layering/CMakeLists.txt
+ create mode 100644 app/dice_layering/el0_app/mbedtls_dice_layering/rmm_mbedtls_config_dice_layering.h
+ create mode 100644 app/dice_layering/el0_app/src/dice_layering_app.c
+ create mode 100644 app/dice_layering/el0_app/src/dice_layering_app.h
+ create mode 100644 app/dice_layering/el0_app/src/dice_layering_crypto.c
+ create mode 100644 app/dice_layering/el0_app/src/dice_layering_crypto.h
+ create mode 100644 app/dice_layering/rmm_stub/CMakeLists.txt
+ create mode 100644 app/dice_layering/rmm_stub/include/dice_layering_app.h
+ create mode 100644 app/dice_layering/rmm_stub/include/dice_layering_defs.h
+ create mode 100644 app/dice_layering/rmm_stub/src/app_support/dice_layering_app.c
+ create mode 100644 runtime/rsi/realm_dice_operations.c
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 91c1a678..a2b814a5 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -175,12 +175,12 @@ if(NOT RMM_ARCH STREQUAL fake_host)
+     add_custom_command(
+         COMMAND "${BUNDLE_APP_RMM}" --out-bin ${ARTEFACT_DIR}/${RMM_IMG} --rmm-bin ${ARTEFACT_DIR}/rmm_core.img --log-file-name ${BUNDLE_COMMAND_OUTPUT} ${EL0_APP_BIN_LIST}
+         OUTPUT ${RMM_IMG}
+-        DEPENDS rmm_core.img rmm-random-app rmm-attestation-app rmm-dev-assign-app)
++        DEPENDS rmm_core.img rmm-random-app rmm-attestation-app rmm-dev-assign-app rmm-dice-layering-app)
+ endif()
+ 
+ add_custom_target(rmm ALL DEPENDS
+         rmm_core.img rmm_core.dump rmm_core.elf rmm.elf rmm_core.map
+-        ${RMM_IMG} rmm-attestation-app rmm-random-app rmm-dev-assign-app)
++        ${RMM_IMG} rmm-attestation-app rmm-random-app rmm-dev-assign-app rmm-dice-layering-app)
+ 
+ #
+ # Set up additional tooling.
+diff --git a/app/CMakeLists.txt b/app/CMakeLists.txt
+index 28651916..538efa3f 100644
+--- a/app/CMakeLists.txt
++++ b/app/CMakeLists.txt
+@@ -15,6 +15,7 @@ set(EL0_APP_BIN_LIST "")
+ add_subdirectory("attestation")
+ add_subdirectory("device_assignment")
+ add_subdirectory("random")
++add_subdirectory("dice_layering")
+ 
+ set(EL0_APP_BIN_LIST ${EL0_APP_BIN_LIST} PARENT_SCOPE)
+ 
+diff --git a/app/common/framework/include/app.h b/app/common/framework/include/app.h
+index a7143f81..328a5373 100644
+--- a/app/common/framework/include/app.h
++++ b/app/common/framework/include/app.h
+@@ -28,6 +28,7 @@
+  * https://cmake.org/cmake/help/latest/command/configure_file.html
+  */
+ #define RMM_RANDOM_APP_ID			(103U)
++#define DICE_LAYERING_APP_ID			(104U)
+ #define ATTESTATION_APP_ID			(211U)
+ #define RMM_DEV_ASSIGN_APP_ID			(110U)
+ 
+diff --git a/app/common/framework/include/app_header.h b/app/common/framework/include/app_header.h
+index f0fc65ef..24cecc4c 100644
+--- a/app/common/framework/include/app_header.h
++++ b/app/common/framework/include/app_header.h
+@@ -12,7 +12,7 @@
+ #include <stdint.h>
+ #endif
+ 
+-#define APP_COUNT		3U
++#define APP_COUNT		4U
+ 
+ #ifndef __ASSEMBLER__
+ 
+diff --git a/app/common/framework/src/aarch64/app.c b/app/common/framework/src/aarch64/app.c
+index 3ea071ab..4c30fcb5 100644
+--- a/app/common/framework/src/aarch64/app.c
++++ b/app/common/framework/src/aarch64/app.c
+@@ -521,6 +521,7 @@ static void collect_app_bss(void)
+ 	void attest_app_get_bss(uintptr_t *bss_pa, size_t *bss_size);
+ 	void random_app_get_bss(uintptr_t *bss_pa, size_t *bss_size);
+ 	void dev_assign_app_get_bss(uintptr_t *bss_pa, size_t *bss_size);
++	void dice_layering_app_get_bss(uintptr_t *bss_pa, size_t *bss_size);
+ 
+ 	ret = app_get_index(ATTESTATION_APP_ID, &app_index);
+ 	assert(ret == 0);
+@@ -534,6 +535,10 @@ static void collect_app_bss(void)
+ 	assert(ret == 0);
+ 	dev_assign_app_get_bss(&app_bss_memory_array[app_index].pa,
+ 			&app_bss_memory_array[app_index].size);
++	ret = app_get_index(DICE_LAYERING_APP_ID, &app_index);
++	assert(ret == 0);
++	dice_layering_app_get_bss(&app_bss_memory_array[app_index].pa,
++			&app_bss_memory_array[app_index].size);
+ }
+ 
+ void app_framework_setup(void)
+diff --git a/app/dice_layering/CMakeLists.txt b/app/dice_layering/CMakeLists.txt
+new file mode 100644
+index 00000000..6e6298d0
+--- /dev/null
++++ b/app/dice_layering/CMakeLists.txt
+@@ -0,0 +1,9 @@
++#
++# SPDX-License-Identifier: BSD-3-Clause
++#
++
++add_subdirectory("el0_app")
++add_subdirectory("rmm_stub")
++
++set(EL0_APP_BIN_LIST ${EL0_APP_BIN_LIST} PARENT_SCOPE)
++set(RMM_EL2_STUB_LIBRARIES ${RMM_EL2_STUB_LIBRARIES} PARENT_SCOPE)
+diff --git a/app/dice_layering/el0_app/CMakeLists.txt b/app/dice_layering/el0_app/CMakeLists.txt
+new file mode 100644
+index 00000000..84219c12
+--- /dev/null
++++ b/app/dice_layering/el0_app/CMakeLists.txt
+@@ -0,0 +1,53 @@
++#
++# SPDX-License-Identifier: BSD-3-Clause
++#
++
++if(RMM_CBMC_STATIC_ANALYSIS)
++    add_library(rmm-app-dice-layering-elf INTERFACE)
++    return()
++endif()
++
++add_subdirectory("mbedtls_dice_layering")
++
++include("${CMAKE_CURRENT_SOURCE_DIR}/../../common/el0_app/CommonApp.cmake")
++
++set(DICE_LAYERING_APP_ID 104)
++
++arm_config_option(
++    NAME RMM_NUM_PAGES_PER_DICE_LAYERING_APP_STACK
++    HELP "Number of pages to use for the DICE Layering app stack"
++    TYPE STRING
++    DEFAULT 4
++    ADVANCED)
++
++arm_config_option(
++    NAME RMM_NUM_PAGES_PER_DICE_LAYERING_APP_HEAP
++    HELP "Number of pages to use for the DICE Layering app heap"
++    TYPE STRING
++    DEFAULT 4
++    ADVANCED)
++
++add_el0_app(
++    APP_NAME dice_layering
++    APP_ID ${DICE_LAYERING_APP_ID}
++    APP_DISPLAY_NAME "dice_layering_app"
++    STACK_SIZE_VAR RMM_NUM_PAGES_PER_DICE_LAYERING_APP_STACK
++    HEAP_SIZE_VAR RMM_NUM_PAGES_PER_DICE_LAYERING_APP_HEAP
++    SOURCES
++        "src/dice_layering_app.c"
++        "src/dice_layering_crypto.c"
++    LINK_LIBRARIES
++        rmm-app-dice-layering-mbedtls
++        rmm-lib-common
++        rmm-lib-debug
++        rmm-lib-pcpu_data
++        rmm-lib-smc
++)
++
++target_include_directories(rmm-app-dice-layering-elf
++    PRIVATE
++        "${RMM_SOURCE_DIR}/app/attestation/rmm_stub/include"
++)
++
++# Propagate EL0_APP_BIN_LIST to parent scope
++set(EL0_APP_BIN_LIST ${EL0_APP_BIN_LIST} PARENT_SCOPE)
+diff --git a/app/dice_layering/el0_app/mbedtls_dice_layering/CMakeLists.txt b/app/dice_layering/el0_app/mbedtls_dice_layering/CMakeLists.txt
+new file mode 100644
+index 00000000..d4ba35f8
+--- /dev/null
++++ b/app/dice_layering/el0_app/mbedtls_dice_layering/CMakeLists.txt
+@@ -0,0 +1,47 @@
++#
++# SPDX-License-Identifier: BSD-3-Clause
++#
++
++include(${CMAKE_SOURCE_DIR}/cmake/Sanitizers.cmake)
++
++set(MBEDTLS_TARGET_PREFIX "dice_layering_")
++
++if(RMM_CBMC_STATIC_ANALYSIS)
++    add_library(rmm-app-dice-layering-mbedtls INTERFACE)
++    return()
++endif()
++
++set(MBEDTLS_SRC_DIR "${RMM_SOURCE_DIR}/ext/mbedtls")
++set(MBEDTLS_BIN_DIR "${CMAKE_CURRENT_BINARY_DIR}/mbedtls_dice_layering")
++
++function(link_to_source base_name)
++endfunction(link_to_source)
++
++set(BACKUP_C_FLAGS "${CMAKE_C_FLAGS}")
++strip_sanitizer_flags()
++add_subdirectory("${MBEDTLS_SRC_DIR}/library" "${MBEDTLS_BIN_DIR}/library"
++                    EXCLUDE_FROM_ALL)
++set(CMAKE_C_FLAGS "${BACKUP_C_FLAGS}")
++
++add_library(rmm-app-dice-layering-mbedtls INTERFACE)
++
++add_dependencies(rmm-app-dice-layering-mbedtls rmm-mbedtls)
++
++target_include_directories(rmm-app-dice-layering-mbedtls INTERFACE
++    "${RMM_SOURCE_DIR}/app/dice_layering/el0_app/mbedtls_dice_layering"
++    "${MBEDTLS_SRC_DIR}/include")
++target_compile_definitions(rmm-app-dice-layering-mbedtls INTERFACE
++    "-DMBEDTLS_CONFIG_FILE=<rmm_mbedtls_config_dice_layering.h>")
++
++set(MBEDTLS_LIBS mbedcrypto)
++list(APPEND MBEDTLS_LIBS mbedx509)
++
++foreach(MBEDTLS_LIB IN ITEMS ${MBEDTLS_LIBS})
++    target_include_directories(${MBEDTLS_TARGET_PREFIX}${MBEDTLS_LIB} PUBLIC
++        "${RMM_SOURCE_DIR}/app/dice_layering/el0_app/mbedtls_dice_layering"
++        "${MBEDTLS_SRC_DIR}/include")
++    target_compile_definitions(${MBEDTLS_TARGET_PREFIX}${MBEDTLS_LIB} PUBLIC
++        "-DMBEDTLS_CONFIG_FILE=<rmm_mbedtls_config_dice_layering.h>")
++    target_link_libraries(rmm-app-dice-layering-mbedtls INTERFACE ${MBEDTLS_TARGET_PREFIX}${MBEDTLS_LIB})
++    target_link_libraries(${MBEDTLS_TARGET_PREFIX}${MBEDTLS_LIB} PRIVATE rmm-app-common-el0_app)
++endforeach()
+diff --git a/app/dice_layering/el0_app/mbedtls_dice_layering/rmm_mbedtls_config_dice_layering.h b/app/dice_layering/el0_app/mbedtls_dice_layering/rmm_mbedtls_config_dice_layering.h
+new file mode 100644
+index 00000000..f9438ccb
+--- /dev/null
++++ b/app/dice_layering/el0_app/mbedtls_dice_layering/rmm_mbedtls_config_dice_layering.h
+@@ -0,0 +1,83 @@
++/*
++ * SPDX-License-Identifier: BSD-3-Clause
++ */
++
++#include <limits.h>
++#include <stddef.h>
++#include <stdio.h>
++#include <string.h>
++
++static inline char *rmm_mbedtls_strncpy(char *dst, const char *src, size_t n)
++{
++	size_t i = 0U;
++
++	for (; (i < n) && (src[i] != '\0'); i++) {
++		dst[i] = src[i];
++	}
++	for (; i < n; i++) {
++		dst[i] = '\0';
++	}
++	return dst;
++}
++#define strncpy rmm_mbedtls_strncpy
++
++/* This file is compatible with release 3.6.0 */
++#define MBEDTLS_CONFIG_VERSION         0x03060000
++
++/*
++ * Configuration file to build mbed TLS with the required features for
++ * DICE Layering in RMM.
++ */
++#define MBEDTLS_PLATFORM_MEMORY
++#define MBEDTLS_MEMORY_BUFFER_ALLOC_C
++
++/* RMM defines its own mbedtls_exit */
++#define MBEDTLS_PLATFORM_EXIT_MACRO mbedtls_exit_panic
++void mbedtls_exit_panic(unsigned int reason);
++
++#define MBEDTLS_PLATFORM_NO_STD_FUNCTIONS
++#define MBEDTLS_PLATFORM_SNPRINTF_MACRO snprintf
++#define MBEDTLS_PLATFORM_C
++
++#define MBEDTLS_PSA_CRYPTO_C
++#define MBEDTLS_USE_PSA_CRYPTO
++#define MBEDTLS_PSA_ASSUME_EXCLUSIVE_BUFFERS
++
++#define MBEDTLS_ECP_C
++#define MBEDTLS_ECP_DP_SECP256R1_ENABLED
++#define MBEDTLS_ECDSA_C
++#define MBEDTLS_ECDSA_DETERMINISTIC
++#define MBEDTLS_ECP_WINDOW_SIZE		(2U)
++
++#define MBEDTLS_PSA_CRYPTO_EXTERNAL_RNG
++
++#define MBEDTLS_ASN1_PARSE_C
++#define MBEDTLS_ASN1_WRITE_C
++#define MBEDTLS_BASE64_C
++#define MBEDTLS_BIGNUM_C
++#define MBEDTLS_ERROR_C
++#define MBEDTLS_HKDF_C
++#define MBEDTLS_HMAC_DRBG_C
++#define MBEDTLS_MD_C
++
++#define MBEDTLS_SHA256_C
++#define MBEDTLS_SHA384_C
++#define MBEDTLS_SHA512_C
++
++#define MBEDTLS_OID_C
++#define MBEDTLS_PK_C
++#define MBEDTLS_PK_PARSE_C
++#define MBEDTLS_PK_WRITE_C
++
++#define MBEDTLS_X509_USE_C
++#define MBEDTLS_X509_CRT_PARSE_C
++#define MBEDTLS_X509_CREATE_C
++#define MBEDTLS_X509_CRT_WRITE_C
++
++#define MBEDTLS_VERSION_C
++
++/* Prevent the use of 128-bit division */
++#define MBEDTLS_NO_UDBL_DIVISION
++
++/* Memory buffer allocator alignment */
++#define MBEDTLS_MEMORY_ALIGN_MULTIPLE	8
+diff --git a/app/dice_layering/el0_app/src/dice_layering_app.c b/app/dice_layering/el0_app/src/dice_layering_app.c
+new file mode 100644
+index 00000000..1d285b6e
+--- /dev/null
++++ b/app/dice_layering/el0_app/src/dice_layering_app.c
+@@ -0,0 +1,430 @@
++/*
++ * SPDX-License-Identifier: BSD-3-Clause
++ */
++
++#include <app_common.h>
++#include <arch.h>
++#include <arch_features.h>
++#include <assert.h>
++#include <el0_app_helpers.h>
++#include <errno.h>
++#include <mbedtls/memory_buffer_alloc.h>
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++#include <attest_defs.h>
++#include <dice_layering_app.h>
++#include <dice_layering_defs.h>
++#include <smc-rmi.h>
++#include <psa/crypto.h>
++#include <string.h>
++#include <mbedtls/oid.h>
++#include <mbedtls/asn1.h>
++
++#include <dice_layering_crypto.h>
++
++/* sha256 and sha512 oid are of the same length. */
++#define OID_LEN MBEDTLS_OID_SIZE(MBEDTLS_OID_DIGEST_ALG_SHA256)
++#define CDI_TCI_BUF_LEN (CDI_LEN + MAX_MEASUREMENT_SIZE + OID_LEN + RPV_SIZE)
++
++#define MAX_SEED_LEN 64
++
++#define RAK_SALT "RAK"
++#define RAK_SALT_LEN 3
++
++#define RIK_SALT "RIK"
++#define RIK_SALT_LEN 3
++
++struct dice_realm_data {
++	uint8_t rim[MAX_MEASUREMENT_SIZE];
++	enum hash_algo algorithm;
++	uint8_t rpv[RPV_SIZE];
++};
++
++COMPILER_ASSERT(sizeof(struct crypto_identity) <= GRANULE_SIZE);
++COMPILER_ASSERT(sizeof(struct dice_manifest_data) <= GRANULE_SIZE);
++
++/*
++ * True when the first app instance (on CPU0) is initialized.
++ * In this way the other instances will not copy the shared page
++ * content to get the RMM dice init data. Such data are stored in
++ * the static variable therefore defined (dice_data)
++ */
++static bool dice_layering_init_done = false;
++
++/*
++ * Local copy of the rmm cryptographic data.
++ *
++ * This is needed since the shared page, used for receiving such data,
++ * is also used when the random_app is invoked to get random data. So,
++ * a zero-copy approach would cause the alteration of the input.
++ */
++static struct dice_manifest_data dice_data;
++
++void *mbedtls_app_get_heap(void)
++{
++	return &((struct dice_layering_heap_t *)get_heap_start())->mbedtls_heap_ctx;
++}
++
++/*
++ * This function is used by Mbed TLS as a source of entropy. This means it is
++ * called during RMM operation, to add entropy to the signing process.
++ * See declaration in ext/mbedtls/include/psa/crypto_extra.h.
++ * For details see `MBEDTLS_PSA_CRYPTO_EXTERNAL_RNG` in mbedtls/mbedtls_config.h
++ */
++psa_status_t mbedtls_psa_external_get_random(
++	mbedtls_psa_external_random_context_t *context,
++	uint8_t *output, size_t output_size, size_t *output_length)
++{
++	unsigned long ret;
++
++	assert(output_size <= get_shared_mem_size());
++	ret = el0_app_service_call(APP_SERVICE_RANDOM,
++				   output_size, 0, 0, 0);
++
++	(void)context;
++
++	if (ret != 0U) {
++		return PSA_ERROR_HARDWARE_FAILURE;
++	}
++
++	(void)memcpy((void *)output, get_shared_mem_start(), output_size);
++	*output_length = output_size;
++
++	return PSA_SUCCESS;
++}
++
++static int generate_realm_cdi(struct dice_realm_data *realm_input,
++			      struct crypto_identity *output)
++{
++	uint8_t buf[CDI_TCI_BUF_LEN];
++	size_t buf_len = 0;
++	size_t seed_len = 0;
++	unsigned int rim_len;
++	int ret = -1;
++
++	/* Copy the CDI(RMM) value. */
++	memcpy(buf, dice_data.cdi_rmm, CDI_LEN);
++	/*
++	 * With a switch-case statement it is more easy extend the algorithm
++	 * list in the future.
++	 */
++	switch (realm_input->algorithm) {
++	case HASH_SHA_256:
++		rim_len = PSA_HASH_LENGTH(PSA_ALG_SHA_256);
++		break;
++	case HASH_SHA_512:
++		rim_len = PSA_HASH_LENGTH(PSA_ALG_SHA_512);
++		break;
++	default:
++		return -1;
++	}
++
++	if (rim_len > MAX_MEASUREMENT_SIZE) {
++		assert(false);
++		return -1;
++	}
++	/* Append the Realm Initial Measurement. */
++	memcpy(&buf[CDI_LEN], realm_input->rim, rim_len);
++
++	/* Append the hash algorithm OID. */
++	switch (realm_input->algorithm) {
++	case HASH_SHA_256:
++		memcpy(&buf[CDI_LEN + rim_len], MBEDTLS_OID_DIGEST_ALG_SHA256, OID_LEN);
++		break;
++	case HASH_SHA_512:
++		memcpy(&buf[CDI_LEN + rim_len], MBEDTLS_OID_DIGEST_ALG_SHA512, OID_LEN);
++		break;
++	default:
++		return -1;
++	}
++
++	/* Append the Realm Personalization Value. */
++	memcpy(&buf[CDI_LEN + rim_len + OID_LEN], realm_input->rpv, RPV_SIZE);
++	buf_len = CDI_LEN + rim_len + OID_LEN + RPV_SIZE;
++
++	ret = derive_seed(buf, buf_len, output->cdi, &seed_len);
++
++	/* Check if the seed length is the expected one. */
++	if (seed_len != CDI_LEN) {
++		assert(false);
++		return -1;
++	}
++
++	return ret;
++}
++
++/*
++ * The same function generates both the RAK and the RIK.
++ */
++static int generate_key_pairs(const uint8_t *cdi, size_t cdi_len,
++			      struct crypto_identity *output,
++			      psa_key_id_t *rak_id, psa_key_id_t *rik_id)
++{
++	psa_status_t status = PSA_ERROR_CORRUPTION_DETECTED;
++	uint8_t seed[CDI_LEN + RAK_SALT_LEN];
++	size_t seed_len = CDI_LEN + RAK_SALT_LEN;
++	size_t exported_len;
++
++	/*
++	 * RAK SECTION
++	 */
++	memcpy(seed, cdi, cdi_len);
++	memcpy(&seed[cdi_len], RAK_SALT, RAK_SALT_LEN);
++
++	/* Generate the key */
++	status = derive_keypair_deterministic(seed, seed_len, rak_id);
++	if (status != PSA_SUCCESS) goto end;
++
++	/* Extract the private key */
++	status = psa_export_key(*rak_id, output->dsrak, sizeof(output->dsrak), &exported_len);
++	if (status != PSA_SUCCESS) goto end;
++
++	/*
++	 * RIK SECTION
++	 */
++	memcpy(&seed[cdi_len], RIK_SALT, RIK_SALT_LEN);
++	seed_len = CDI_LEN + RIK_SALT_LEN;
++
++	/* Generate the key */
++	status = derive_keypair_deterministic(seed, seed_len, rik_id);
++	if (status != PSA_SUCCESS) goto end;
++
++	/* Extract the private key */
++	status = psa_export_key(*rik_id, output->dsrik, sizeof(output->dsrik), &exported_len);
++	if (status != PSA_SUCCESS) goto end;
++
++end:
++	return status;
++}
++
++/* ====================
++ * APPLICATION HANDLERS
++ * ====================
++ */
++
++/*
++ * Generate the Realm keypair and validate it against the certificate.
++ */
++static int dice_layering_init_data(void)
++{
++	int ret = 0;
++	psa_status_t psa_status;
++
++	struct dice_layering_heap_t *heap = (struct dice_layering_heap_t *)get_heap_start();
++
++	/*
++	 * Some init operations work on variables available to all the app instances.
++	 * Such operations must be performed only once, at the first initialization.
++	 */
++	if (!dice_layering_init_done) {
++		memcpy(&dice_data, get_shared_mem_start(), sizeof(struct dice_manifest_data));
++	}
++	/*
++	 * Once the content of the shared memory has been copied, clean
++	 * that memory area to avoid that the other applications may
++	 * access the dice rmm data.
++	 */
++	memset(get_shared_mem_start(), 0, get_shared_mem_size());
++
++	/* Initialize the mbedtls heap and the psa module */
++	mbedtls_memory_buffer_alloc_init(heap->mbedtls_heap_buf,
++					 sizeof(heap->mbedtls_heap_buf));
++	psa_status = psa_crypto_init();
++	if (psa_status != PSA_SUCCESS)
++		return (unsigned long)(psa_status); /*fix -EINVAL overflow error*/
++
++	/*
++	 * Derive the Realm keypair and verify its validity against the
++	 * certificate chain
++	 */
++	psa_status = derive_keypair_deterministic(dice_data.cdi_rmm, 32,
++						  &heap->rmm_key_id);
++	if(psa_status != PSA_SUCCESS) return psa_status;
++
++	ret = verify_derived_key_vs_cert(heap->rmm_key_id, dice_data.cert_dice_rak,
++					 dice_data.cert_dice_rak_len);
++	if (ret != 0) return ret;
++
++	ret = verify_certificate_chain(dice_data.cert_dice_rak, dice_data.cert_dice_rak_len,
++				       dice_data.cert_tfa, dice_data.cert_tfa_len);
++	if (ret != 0) return ret;
++
++	dice_layering_init_done = true;
++
++	return ret;
++}
++
++/*
++ * Get the Realm measurements data, along with the RPV, and generate the
++ * dice derived cryptographic data. The output must be returned to the
++ * RMM through the shared memory.
++ */
++static int dice_layering_init_realm_crypto(enum hash_algo algorithm)
++{
++	int ret = -1;
++	struct dice_realm_data dice_realm;
++	struct crypto_identity output = {0};
++	psa_key_id_t rak_id = PSA_KEY_ID_NULL, rik_id = PSA_KEY_ID_NULL;
++	size_t rim_len;
++
++	struct dice_layering_heap_t *heap = (struct dice_layering_heap_t *)get_heap_start();
++
++	/*
++	 * Copy the measurement values from the shared page, then clean the memory
++	 * since the same area will be used for other stuff.
++	 */
++	memcpy(dice_realm.rim, get_shared_mem_start(), sizeof(dice_realm.rim));
++	memcpy(dice_realm.rpv, (uint8_t *)get_shared_mem_start() + sizeof(dice_realm.rim),
++	       sizeof(dice_realm.rpv));
++	dice_realm.algorithm = algorithm;
++	memset(get_shared_mem_start(), 0, get_shared_mem_size());
++
++	/*
++	 * Use the input data to compute the TCI.
++	 */
++	ret = generate_realm_cdi(&dice_realm, &output);
++	if (ret != 0) {
++		goto cleanup;
++	}
++
++	/*
++	 * Once the Realm's CDI has been generated, derive the RAK and the RIK.
++	 */
++	ret = generate_key_pairs(output.cdi, sizeof(output.cdi), &output,
++				 &rak_id, &rik_id);
++	if (ret != 0) {
++		goto cleanup;
++	}
++
++	/* Select the appropriate RIM lenght according to the hash algorithm. */
++	rim_len = (dice_realm.algorithm == HASH_SHA_256) ? 32 : 64;
++
++	/*
++	 * Finally generate the public key certificates for both the RIK and RAK
++	 */
++	ret = generate_dice_certificate(rak_id, heap->rmm_key_id,
++					"CN=Realm,O=CCA_Machine",
++					"CN=DICE_RAK,O=CCA_Machine",
++					output.cert_dsrak, sizeof(output.cert_dsrak),
++					&output.cert_dsrak_len,
++					dice_realm.rim, rim_len);
++	if (ret != 0) {
++		goto cleanup;
++	}
++
++	ret = generate_dice_certificate(rik_id, heap->rmm_key_id,
++					"CN=Realm,O=CCA_Machine",
++					"CN=DICE_RAK,O=CCA_Machine",
++					output.cert_dsrik, sizeof(output.cert_dsrik),
++					&output.cert_dsrik_len,
++					dice_realm.rim, rim_len);
++	if (ret != 0) {
++		goto cleanup;
++	}
++
++	/* Copy the generated data back to the RMM through the shared page. */
++	memcpy(get_shared_mem_start(), &output, sizeof(struct crypto_identity));
++	el0_app_yield();
++
++cleanup:
++	psa_destroy_key(rak_id);
++	psa_destroy_key(rik_id);
++	return ret;
++}
++
++static int dice_layering_sign_data(size_t key_len, size_t payload_len,
++				   size_t out_size)
++{
++	uint8_t key[SEC_KEY_LEN];
++	uint8_t payload[64];
++	uint8_t signature[128];
++	size_t signature_len;
++	uint8_t *shared = get_shared_mem_start();
++	int ret;
++
++	if ((key_len > sizeof(key)) || (payload_len > sizeof(payload))) {
++		return -EINVAL;
++	}
++
++	memcpy(key, shared, key_len);
++	memcpy(payload, shared + key_len, payload_len);
++	memset(shared, 0, get_shared_mem_size());
++
++	ret = sign_payload_deterministic_ecdsa(key, key_len, payload, payload_len,
++					       signature, sizeof(signature),
++					       &signature_len);
++	if (ret != 0) {
++		return ret;
++	}
++	if (signature_len > out_size) {
++		return -EINVAL;
++	}
++
++	memcpy(shared, &signature_len, sizeof(signature_len));
++	memcpy(shared + sizeof(signature_len), signature, signature_len);
++	return ret;
++}
++
++static int dice_layering_output_certs(void)
++{
++	struct cert_chain *out = (struct cert_chain *)get_shared_mem_start();
++	if (out == NULL) return -1;
++
++	memcpy(out->cert_dice_rak, dice_data.cert_dice_rak, dice_data.cert_dice_rak_len);
++	out->cert_dice_rak_len = dice_data.cert_dice_rak_len;
++
++	memcpy(out->cert_tfa, dice_data.cert_tfa, dice_data.cert_tfa_len);
++	out->cert_tfa_len = dice_data.cert_tfa_len;
++
++	return 0;
++}
++
++unsigned long el0_app_entry_func(
++	unsigned long func_id,
++	unsigned long arg_0,
++	unsigned long arg_1,
++	unsigned long arg_2,
++	unsigned long arg_3)
++{
++	(void)arg_3;
++
++	switch (func_id) {
++	case DICE_LAYERING_APP_FUNC_ID_INIT:
++		/*
++		 * init_function
++		 * consider if passing the RMM CDI at this step since it
++		 * does not change once generated.
++		 *
++		 * Needed inputs:
++		 * - the RMM CDI
++		 * - the certificate chain
++		 */
++		return dice_layering_init_data();
++		break;
++	case DICE_LAYERING_APP_FUNC_ID_REALM_INIT:
++		/*
++		 * Given a RIM and a CDI(n-1) (?), generate
++		 * - a Deterministic ECDSA keypair
++		 * - a certificate for the pubkey
++		 */
++		return dice_layering_init_realm_crypto((enum hash_algo)arg_0);
++		break;
++	case DICE_LAYERING_APP_FUNC_ID_SIGN_DSRAK:
++	case DICE_LAYERING_APP_FUNC_ID_SIGN_DSRIK:
++		/*
++		 * Perform a cryptographic operation on behalf of the
++		 * Realm which is requesting such operation.
++		 */
++		return dice_layering_sign_data(arg_0, arg_1, arg_2);
++		break;
++	case DICE_LAYERING_APP_FUNC_ID_GET_CERT:
++		return dice_layering_output_certs();
++		break;
++	default:
++		assert(false);
++		return 0;
++	}
++
++	return 0;
++}
+diff --git a/app/dice_layering/el0_app/src/dice_layering_app.h b/app/dice_layering/el0_app/src/dice_layering_app.h
+new file mode 100644
+index 00000000..7dc3b264
+--- /dev/null
++++ b/app/dice_layering/el0_app/src/dice_layering_app.h
+@@ -0,0 +1,24 @@
++/*
++ * SPDX-License-Identifier: BSD-3-Clause
++ */
++
++#ifndef DICE_LAYERING_EL0_APP_H
++#define DICE_LAYERING_EL0_APP_H
++
++#include <limits.h>
++#include <mbedtls/memory_buffer_alloc.h>
++#include <stddef.h>
++#include <psa/crypto.h>
++#include <utils_def.h>
++
++#define DICE_LAYERING_HEAP_SIZE		(3U * GRANULE_SIZE)
++
++struct dice_layering_heap_t {
++	buffer_alloc_ctx mbedtls_heap_ctx;
++	psa_key_id_t rmm_key_id;
++	unsigned char mbedtls_heap_buf[DICE_LAYERING_HEAP_SIZE] __aligned(sizeof(unsigned long));
++};
++COMPILER_ASSERT(sizeof(struct dice_layering_heap_t) <= HEAP_PAGE_COUNT * GRANULE_SIZE);
++COMPILER_ASSERT((UL(offsetof(struct dice_layering_heap_t, mbedtls_heap_buf)) % sizeof(unsigned long)) == 0U);
++
++#endif /* DICE_LAYERING_EL0_APP_H */
+diff --git a/app/dice_layering/el0_app/src/dice_layering_crypto.c b/app/dice_layering/el0_app/src/dice_layering_crypto.c
+new file mode 100644
+index 00000000..283232cb
+--- /dev/null
++++ b/app/dice_layering/el0_app/src/dice_layering_crypto.c
+@@ -0,0 +1,617 @@
++/*
++ * SPDX-License-Identifier: BSD-3-Clause
++ */
++
++#include <dice_layering_crypto.h>
++
++#include <mbedtls/pk.h>
++#include <mbedtls/x509_crt.h>
++#include <mbedtls/x509.h>
++#include <mbedtls/asn1write.h>
++#include <mbedtls/oid.h>
++#include <string.h>
++#include <debug.h>
++
++#define MAX_EC_PUB_KEY_SIZE 133
++
++static int dummy_rng_wrapper(void *ctx, unsigned char *buf, size_t len)
++{
++	(void)ctx; /* Unused */
++
++	if (buf != NULL && len > 0) {
++		/* Fill with zeros to avoid uninitialized memory access just in case */
++		memset(buf, 0, len);
++	}
++
++	return PSA_SUCCESS;
++}
++
++int derive_keypair_deterministic(void* seed, size_t seed_len,
++				 psa_key_id_t* key_id)
++{
++	/*
++	 * 1. Import the seed in the vault
++	 */
++	psa_status_t status = PSA_ERROR_CORRUPTION_DETECTED;
++	psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
++	psa_key_derivation_operation_t deriv_op = PSA_KEY_DERIVATION_OPERATION_INIT;
++
++	psa_key_id_t seed_id = PSA_KEY_ID_NULL;
++
++	psa_set_key_type(&attributes, PSA_KEY_TYPE_DERIVE);
++	psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_DERIVE);
++	psa_set_key_algorithm(&attributes, PSA_ALG_HKDF(PSA_ALG_SHA_256));
++
++	status = psa_import_key(&attributes, seed, seed_len, &seed_id);
++	if (status != PSA_SUCCESS) return status;
++
++	/*
++	 * 2. Derive the keypair
++	 */
++	attributes = psa_key_attributes_init();
++
++	status = psa_key_derivation_setup(&deriv_op,
++					  PSA_ALG_HKDF(PSA_ALG_SHA_256));
++	if (status != PSA_SUCCESS) goto end;
++
++	/*
++	 * Provide NULL salt and info since they are not needed
++	 */
++	status = psa_key_derivation_input_bytes(&deriv_op,
++						PSA_KEY_DERIVATION_INPUT_SALT,
++						NULL, 0);
++	if (status != PSA_SUCCESS) goto end;
++
++	status = psa_key_derivation_input_key(&deriv_op,
++					      PSA_KEY_DERIVATION_INPUT_SECRET,
++					      seed_id);
++	if (status != PSA_SUCCESS) goto end;
++
++	status = psa_key_derivation_input_bytes(&deriv_op,
++						PSA_KEY_DERIVATION_INPUT_INFO,
++						NULL, 0);
++	if (status != PSA_SUCCESS) goto end;
++
++	/* Set the curve and the key dimension */
++	psa_set_key_type(&attributes,
++			 PSA_KEY_TYPE_ECC_KEY_PAIR(PSA_ECC_FAMILY_SECP_R1));
++
++	psa_set_key_bits(&attributes, 256);
++
++	/* Set key permissions */
++	psa_set_key_usage_flags(&attributes,
++				PSA_KEY_USAGE_SIGN_HASH | PSA_KEY_USAGE_EXPORT);
++	psa_set_key_algorithm(&attributes,
++			      PSA_ALG_DETERMINISTIC_ECDSA(PSA_ALG_SHA_256));
++
++	/* Generate the key */
++	status = psa_key_derivation_output_key(&attributes, &deriv_op, key_id);
++end:
++	psa_key_derivation_abort(&deriv_op);
++	psa_destroy_key(seed_id);
++
++	return status;
++}
++
++int verify_derived_key_vs_cert(psa_key_id_t key_id,
++			       const uint8_t *cert_buf, size_t cert_buf_len)
++{
++	int ret = -1;
++	psa_status_t status = PSA_ERROR_CORRUPTION_DETECTED;
++	mbedtls_x509_crt cert;
++	psa_key_attributes_t cert_key_attrs = PSA_KEY_ATTRIBUTES_INIT;
++	psa_key_id_t cert_psa_key_id = PSA_KEY_ID_NULL;
++	
++	uint8_t deriv_pub[PSA_EXPORT_PUBLIC_KEY_MAX_SIZE];
++	size_t deriv_pub_len  = 0;
++	uint8_t cert_pub[PSA_EXPORT_PUBLIC_KEY_MAX_SIZE];
++	size_t cert_pub_len   = 0;
++	
++	mbedtls_x509_crt_init(&cert);
++	
++	ret = mbedtls_x509_crt_parse_der_nocopy(&cert, cert_buf, cert_buf_len);
++	if (ret != 0) {
++		ERROR("Failed to parse DER certificate: -0x%04x\n", -ret);
++		goto cleanup;
++	}
++	
++	if (!mbedtls_pk_can_do(&cert.pk, MBEDTLS_PK_ECDSA)) {
++		ERROR("Certificate public key is not ECDSA.\n");
++		ret = MBEDTLS_ERR_PK_KEY_INVALID_FORMAT;
++		goto cleanup;
++	}
++	
++	status = psa_export_public_key(key_id, deriv_pub,
++				       sizeof(deriv_pub), &deriv_pub_len);
++
++	if (status != PSA_SUCCESS) {
++		ERROR("psa_export_public_key() failed: %d\n", (int)status);
++		ret = MBEDTLS_ERR_PK_BAD_INPUT_DATA;
++		goto cleanup;
++	}
++
++	ret = mbedtls_pk_get_psa_attributes(&cert.pk,
++					    PSA_KEY_USAGE_VERIFY_HASH,
++					    &cert_key_attrs);
++	if (ret != 0) {
++		ERROR("mbedtls_pk_get_psa_attributes() failed: -0x%04x\n", -ret);
++		goto cleanup;
++	}
++
++	psa_set_key_usage_flags(&cert_key_attrs,
++				psa_get_key_usage_flags(&cert_key_attrs) |
++				PSA_KEY_USAGE_EXPORT);
++
++	ret = mbedtls_pk_import_into_psa(&cert.pk,
++					 &cert_key_attrs,
++					 &cert_psa_key_id);
++	if (ret != 0) {
++		ERROR("mbedtls_pk_import_into_psa() failed: -0x%04x\n", -ret);
++		goto cleanup;
++	}
++
++	status = psa_export_public_key(cert_psa_key_id,
++				       cert_pub, sizeof(cert_pub),
++				       &cert_pub_len);
++	if (status != PSA_SUCCESS) {
++		ERROR("psa_export_public_key() for cert key failed: %d\n",
++		      (int)status);
++		ret = MBEDTLS_ERR_PK_BAD_INPUT_DATA;
++		goto cleanup;
++	}
++
++	if (deriv_pub_len != cert_pub_len) {
++		ERROR("Public key length mismatch: derived=%zu cert=%zu\n",
++		       deriv_pub_len, cert_pub_len);
++		ret = MBEDTLS_ERR_PK_BAD_INPUT_DATA;
++		goto cleanup;
++	}
++
++	if (memcmp(deriv_pub, cert_pub, deriv_pub_len) != 0) {
++		ERROR("Derived key does not match the certificate public key.\n");
++		ret = MBEDTLS_ERR_PK_BAD_INPUT_DATA;
++		goto cleanup;
++	}
++
++	ret = 0;
++
++cleanup:
++	if (cert_psa_key_id != PSA_KEY_ID_NULL) {
++		psa_status_t destroy_status = psa_destroy_key(cert_psa_key_id);
++		if (destroy_status != PSA_SUCCESS) {
++			ERROR("psa_destroy_key() failed: %d\n",
++			      (int)destroy_status);
++			if (ret == 0) {
++				ret = MBEDTLS_ERR_PK_BAD_INPUT_DATA;
++			}
++		}
++	}
++
++	psa_reset_key_attributes(&cert_key_attrs);
++	mbedtls_x509_crt_free(&cert);
++	return ret;
++}
++
++int verify_certificate_chain(const uint8_t *child_der, size_t child_len,
++			     const uint8_t *parent_der, size_t parent_len)
++{
++	int ret = -1;
++	uint32_t flags = 0;
++	mbedtls_x509_crt child_crt;
++	mbedtls_x509_crt parent_crt;
++
++	/* Initialize both contexts */
++	mbedtls_x509_crt_init(&child_crt);
++	mbedtls_x509_crt_init(&parent_crt);
++
++	/*
++	 * 1. Parse the child certificate
++	 * Using nocopy assumes the DER buffers remain mapped in memory
++	 * for the duration of this function.
++	 */
++	ret = mbedtls_x509_crt_parse_der_nocopy(&child_crt, child_der, child_len);
++	if (ret != 0) {
++		ERROR("Failed to parse child cert: -0x%04x\n", -ret);
++		goto cleanup;
++	}
++
++	/* 2. Parse the parent (issuer) certificate */
++	ret = mbedtls_x509_crt_parse_der_nocopy(&parent_crt, parent_der, parent_len);
++	if (ret != 0) {
++		ERROR("Failed to parse parent cert: -0x%04x\n", -ret);
++		goto cleanup;
++	}
++
++	/*
++	 * 3. Verify the child against the parent
++	 *
++	 * Parameters:
++	 *   &child_crt : The certificate to verify
++	 *   &parent_crt: The trusted CA chain
++	 *   NULL       : Certificate Revocation List (CRL) - not used here
++	 *   NULL       : Expected Common Name (CN) - skips domain validation
++	 *   &flags     : Output flags detailing any verification errors
++	 *   NULL       : Custom verification profile (NULL uses the default)
++	 *   NULL       : Custom verification callback
++	 */
++	ret = mbedtls_x509_crt_verify(&child_crt, &parent_crt, NULL, NULL, &flags, NULL, NULL);
++
++	if (ret != 0) {
++		ERROR("Certificate verification failed: -0x%04x\n", -ret);
++
++		/* If validation failed, decode the flags to find out why */
++		if (flags != 0) {
++			char vrfy_buf[512];
++			/* This translates the bitmask flags into human-readable text */
++			mbedtls_x509_crt_verify_info(vrfy_buf, sizeof(vrfy_buf), "  ! ", flags);
++			ERROR("Verification breakdown:\n%s\n", vrfy_buf);
++		}
++		goto cleanup;
++	}
++
++	INFO("Success: Child certificate is signed by the parent and is valid.\n");
++	ret = 0;
++
++cleanup:
++	/* Free the internal structures (does not free the nocopy DER buffers) */
++	mbedtls_x509_crt_free(&child_crt);
++	mbedtls_x509_crt_free(&parent_crt);
++	return ret;
++}
++
++/*
++ * Derive a value by the mean of a pseudo random function.
++ * As a first implementation, use directly HKDF.
++ * The derived value is either exported to the caller
++ */
++int derive_seed(const void* input, size_t input_len, void* output, size_t* output_len)
++{
++	psa_status_t status;
++	psa_key_derivation_operation_t deriv_op = PSA_KEY_DERIVATION_OPERATION_INIT;
++
++	status = psa_key_derivation_setup(&deriv_op, PSA_ALG_HKDF(PSA_ALG_SHA_256));
++	if (status != PSA_SUCCESS)
++		return status;
++
++	/*
++	 * Provide NULL salt and info since they are not needed.
++	 */
++	status = psa_key_derivation_input_bytes(&deriv_op, PSA_KEY_DERIVATION_INPUT_SALT,
++						NULL, 0);
++	if (status != PSA_SUCCESS) goto end;
++
++	status = psa_key_derivation_input_bytes(&deriv_op, PSA_KEY_DERIVATION_INPUT_SECRET,
++						input, input_len);
++	if (status != PSA_SUCCESS) goto end;
++
++	status = psa_key_derivation_input_bytes(&deriv_op, PSA_KEY_DERIVATION_INPUT_INFO,
++						NULL, 0);
++	if (status != PSA_SUCCESS) goto end;
++
++	/*
++	 * Since SHA256 is hardcoded as hash algorithm, hardcode the out_len
++	 * to 32bytes
++	 */
++	*output_len = 32;
++	status = psa_key_derivation_output_bytes(&deriv_op, output, *output_len);
++end:
++	psa_key_derivation_abort(&deriv_op);
++	return status;
++}
++
++static int add_key_identifiers(mbedtls_x509write_cert *crt,
++			       mbedtls_pk_context *subject_pk,
++			       mbedtls_pk_context *issuer_pk)
++{
++	int ret;
++	unsigned char pub_buf[256];
++	unsigned char hash[32];
++	size_t hash_len;
++	unsigned char ext_buf[64];
++	unsigned char *p;
++	size_t ext_len;
++
++	/* Subject Key Identifier (SKID) */
++	ret = mbedtls_pk_write_pubkey_der(subject_pk, pub_buf, sizeof(pub_buf));
++	if (ret < 0) return ret;
++
++	if (psa_hash_compute(PSA_ALG_SHA_256,
++			     pub_buf + sizeof(pub_buf) - ret, ret,
++			     hash, sizeof(hash), &hash_len) != PSA_SUCCESS) {
++		return -1;
++	}
++
++	ext_len = 0;
++	p = ext_buf + sizeof(ext_buf);
++
++	/* SKID is a standard ASN.1 OCTET STRING */
++	ret = mbedtls_asn1_write_octet_string(&p, ext_buf, hash, 20);
++	if (ret < 0) return ret;
++	ext_len += ret;
++
++	ret = mbedtls_x509write_crt_set_extension(crt, "\x55\x1D\x0E", 3, 0, p, ext_len);
++	if (ret != 0) return ret;
++
++
++	/* Authority Key Identifier (AKID) */
++	ret = mbedtls_pk_write_pubkey_der(issuer_pk, pub_buf, sizeof(pub_buf));
++	if (ret < 0) return ret;
++
++	if (psa_hash_compute(PSA_ALG_SHA_256,
++			     pub_buf + sizeof(pub_buf) - ret, ret,
++			     hash, sizeof(hash), &hash_len) != PSA_SUCCESS) {
++		return -1;
++	}
++
++	ext_len = 0;
++	p = ext_buf + sizeof(ext_buf);
++
++	/* AKID is a SEQUENCE containing an IMPLICIT [0] KeyIdentifier */
++	ret = mbedtls_asn1_write_octet_string(&p, ext_buf, hash, 20);
++	if (ret < 0) return ret;
++	/* Overwrite standard OCTET STRING tag (0x04) with context-specific [0] (0x80) */
++	*p = MBEDTLS_ASN1_CONTEXT_SPECIFIC | 0;
++	ext_len += ret;
++
++	ret = mbedtls_asn1_write_len(&p, ext_buf, ext_len);
++	if (ret < 0) return ret;
++	ext_len += ret;
++
++	ret = mbedtls_asn1_write_tag(&p, ext_buf,
++				     MBEDTLS_ASN1_CONSTRUCTED | MBEDTLS_ASN1_SEQUENCE);
++	if (ret < 0) return ret;
++	ext_len += ret;
++
++	ret = mbedtls_x509write_crt_set_extension(crt, "\x55\x1D\x23", 3, 0, p, ext_len);
++	return ret;
++}
++
++/*
++ * Builds a DICE TCB Info ASN.1 DER payload containing ONLY the fwid.
++ */
++static int build_fwid_only_tcb_info(unsigned char *buf, size_t buf_size,
++				    const unsigned char *fw_hash, size_t fw_hash_len)
++{
++	int ret;
++	size_t len = 0;
++
++	/* Mbed TLS writes backwards from the end of the buffer */
++	unsigned char *p = buf + buf_size;
++	unsigned char *start = buf;
++
++	/* [6] IMPLICIT SEQUENCE OF FWID: fwids */
++	size_t fwid_len = 0;
++
++	/* Write digest */
++	ret = mbedtls_asn1_write_octet_string(&p, start, fw_hash, fw_hash_len);
++	if (ret < 0) return ret;
++	fwid_len += ret;
++
++	/* Write hashAlg (OID) SHA256 */
++	switch (fw_hash_len) {
++	case 32: /*SHA256*/
++		ret = mbedtls_asn1_write_oid(&p, start,
++					     MBEDTLS_OID_DIGEST_ALG_SHA256,
++					     sizeof(MBEDTLS_OID_DIGEST_ALG_SHA256) - 1);
++		break;
++	case 64: /*SHA512*/
++		ret = mbedtls_asn1_write_oid(&p, start,
++					     MBEDTLS_OID_DIGEST_ALG_SHA512,
++					     sizeof(MBEDTLS_OID_DIGEST_ALG_SHA512) - 1);
++		break;
++	}
++
++	if (ret < 0) return ret;
++	fwid_len += ret;
++
++	/* Wrap in standard SEQUENCE tag (0x30) for the single FWID item */
++	ret = mbedtls_asn1_write_len(&p, start, fwid_len);
++	if (ret < 0) return ret;
++	fwid_len += ret;
++	ret = mbedtls_asn1_write_tag(&p, start,
++				     MBEDTLS_ASN1_CONSTRUCTED | MBEDTLS_ASN1_SEQUENCE);
++	if (ret < 0) return ret;
++	fwid_len += ret;
++
++	/* 4. Wrap in IMPLICIT [6] tag (0xA6 = CONSTRUCTED | CONTEXT_SPECIFIC | 6) */
++	ret = mbedtls_asn1_write_len(&p, start, fwid_len);
++	if (ret < 0) return ret;
++	len += fwid_len + ret;
++
++	ret = mbedtls_asn1_write_tag(&p, start,
++				     MBEDTLS_ASN1_CONTEXT_SPECIFIC | MBEDTLS_ASN1_CONSTRUCTED | 6);
++	if (ret < 0) return ret;
++	len += ret;
++
++	/* Wrap everything in the master DiceTcbInfo SEQUENCE (0x30) */
++	ret = mbedtls_asn1_write_len(&p, start, len);
++	if (ret < 0) return ret;
++	len += ret;
++
++	ret = mbedtls_asn1_write_tag(&p, start,
++				     MBEDTLS_ASN1_CONSTRUCTED | MBEDTLS_ASN1_SEQUENCE);
++	if (ret < 0) return ret;
++	len += ret;
++
++	memmove(buf, p, len);
++
++	return (int)len;
++}
++
++int generate_dice_certificate(psa_key_id_t subject_key_id,
++			      psa_key_id_t issuer_key_id,
++			      const char *subject_name,
++			      const char *issuer_name,
++			      uint8_t *out_der, size_t max_out_size,
++			      size_t *cert_len,
++			      uint8_t *rim, size_t rim_len)
++{
++	int ret;
++	mbedtls_pk_context subject_pk;
++	mbedtls_pk_context issuer_pk;
++	mbedtls_x509write_cert crt;
++	mbedtls_mpi serial;
++
++	unsigned char tcb_info[128];
++	size_t tcb_info_len;
++
++	unsigned char serial_bytes[8];
++
++	mbedtls_pk_init(&subject_pk);
++	mbedtls_pk_init(&issuer_pk);
++	mbedtls_x509write_crt_init(&crt);
++	mbedtls_mpi_init(&serial);
++
++	/* Wrap subject key in pk context */
++	ret = mbedtls_pk_setup_opaque(&subject_pk, subject_key_id);
++	if (ret != 0) {
++		goto cleanup;
++	}
++
++	ret = mbedtls_pk_setup_opaque(&issuer_pk, issuer_key_id);
++	if (ret != 0) {
++		goto cleanup;
++	}
++
++	mbedtls_x509write_crt_set_version(&crt, MBEDTLS_X509_CRT_VERSION_3);
++	mbedtls_x509write_crt_set_md_alg(&crt, MBEDTLS_MD_SHA256);
++
++	mbedtls_x509write_crt_set_subject_key(&crt, &subject_pk);
++	mbedtls_x509write_crt_set_issuer_key(&crt, &issuer_pk);
++
++
++	/* Set standard Distinguished Names (DN) */
++	ret = mbedtls_x509write_crt_set_subject_name(&crt, subject_name);
++	if (ret != 0) goto cleanup;
++
++	ret = mbedtls_x509write_crt_set_issuer_name(&crt, issuer_name);
++	if (ret != 0) goto cleanup;
++
++	ret = mbedtls_x509write_crt_set_validity(&crt, "20240101000000", "20991231235959");
++	if (ret != 0) goto cleanup;
++
++	/* Generate a random serial number */
++	if (psa_generate_random(serial_bytes, sizeof(serial_bytes)) != PSA_SUCCESS) {
++		ret = -1;
++		goto cleanup;
++	}
++
++	/* Ensure that the generated number is non negative */
++	serial_bytes[0] &= 0x7F;
++
++	ret = mbedtls_mpi_read_binary(&serial, serial_bytes, sizeof(serial_bytes));
++	if (ret != 0) goto cleanup;
++
++	//mbedtls_mpi_lset(&serial, 1);
++
++	ret = mbedtls_x509write_crt_set_serial(&crt, &serial);
++	if (ret != 0) goto cleanup;
++
++	/* Constraints:
++	 *	- is_ca = 0
++	 *	- max_path_len = 0 (no certificate can be signed )
++	 */
++	ret = mbedtls_x509write_crt_set_basic_constraints(&crt, 0, 0);
++	if (ret != 0) goto cleanup;
++
++	ret = mbedtls_x509write_crt_set_key_usage(&crt, MBEDTLS_X509_KU_DIGITAL_SIGNATURE);
++	if (ret != 0) goto cleanup;
++
++	ret = add_key_identifiers(&crt, &subject_pk, &issuer_pk);
++	if (ret != 0) goto cleanup;
++
++	ret = build_fwid_only_tcb_info(tcb_info, sizeof(tcb_info),
++				       rim, rim_len);
++	(void)rim_len;
++	tcb_info_len = (size_t)ret;
++
++	if (ret < 0) goto cleanup;
++
++	tcb_info_len = (size_t)ret;
++	ret = mbedtls_x509write_crt_set_extension(&crt,
++						  "\x67\x81\x05\x05\x04\x01", 6,
++						  0, /* Non-critical */
++						  tcb_info, tcb_info_len);
++	if (ret != 0) goto cleanup;
++
++	/* clean the memory for the certificate */
++	memset(out_der, 0, max_out_size);
++
++	ret = mbedtls_x509write_crt_der(&crt, out_der, max_out_size,
++					dummy_rng_wrapper, NULL);
++	if (ret > 0) {
++		*cert_len = ret;
++		/*
++		 * Since the function writes the certificate at the end
++		 * of the buffer, move it to the beginning.
++		 */
++		memmove(out_der, out_der + max_out_size - ret, ret);
++		ret = 0;
++	} else {
++		/*
++		 * ret = 0 indicates a failure in the mbedtls_x509write_crt_der
++		 * function. So, set the variable to any value different
++		 * from 0 to ensure a proper return code.
++		 */
++		ret = -1;
++	}
++
++cleanup:
++	/* Free all memory buffers to prevent leaks */
++	mbedtls_pk_free(&subject_pk);
++	mbedtls_pk_free(&issuer_pk);
++	mbedtls_x509write_crt_free(&crt);
++	mbedtls_mpi_free(&serial);
++	//mbedtls_ctr_drbg_free(&ctr_drbg);
++	//mbedtls_entropy_free(&entropy);
++
++	return (ret == 0) ? PSA_SUCCESS : PSA_ERROR_GENERIC_ERROR;
++}
++
++/*
++ * Perform the signature of the given payload.
++ *
++ * The function assumes that the input is already hashed.
++ */
++int sign_payload_deterministic_ecdsa(const uint8_t *priv_key, size_t priv_key_len,
++				     const uint8_t *payload_hash, size_t hash_len,
++				     uint8_t *signature, size_t signature_size,
++				     size_t *signature_len)
++{
++	int ret = -1;
++	psa_status_t status = PSA_ERROR_CORRUPTION_DETECTED;
++	psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
++	psa_key_id_t key_id = PSA_KEY_ID_NULL;
++
++	/* Set key attributes */
++	psa_set_key_type(&attributes, PSA_KEY_TYPE_ECC_KEY_PAIR(PSA_ECC_FAMILY_SECP_R1));
++	psa_set_key_bits(&attributes, 256);
++	psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_SIGN_HASH);
++	psa_set_key_algorithm(&attributes, PSA_ALG_DETERMINISTIC_ECDSA(PSA_ALG_SHA_256));
++
++	status = psa_import_key(&attributes, priv_key, priv_key_len, &key_id);
++	if (status != PSA_SUCCESS) {
++		ERROR("psa_import_key() failed: %d\n", (int)status);
++		ret = -1;
++		goto cleanup;
++	}
++
++	status = psa_sign_hash(key_id,
++			       PSA_ALG_DETERMINISTIC_ECDSA(PSA_ALG_SHA_256),
++			       payload_hash, hash_len,
++			       signature, signature_size, signature_len);
++	if (status != PSA_SUCCESS) {
++		ERROR("psa_sign_hash() failed: %d\n", (int)status);
++		ret = -1;
++		goto cleanup;
++	}
++
++	ret = 0;
++cleanup:
++	psa_status_t destroy_status = psa_destroy_key(key_id);
++        if (destroy_status != PSA_SUCCESS) {
++		ERROR("psa_destroy_key() failed: %d\n", (int)destroy_status);
++		if (ret == 0) ret = -1;
++        }
++	return (ret == 0) ? PSA_SUCCESS : PSA_ERROR_GENERIC_ERROR;
++}
+diff --git a/app/dice_layering/el0_app/src/dice_layering_crypto.h b/app/dice_layering/el0_app/src/dice_layering_crypto.h
+new file mode 100644
+index 00000000..d61d03a3
+--- /dev/null
++++ b/app/dice_layering/el0_app/src/dice_layering_crypto.h
+@@ -0,0 +1,34 @@
++/*
++ * SPDX-License-Identifier: BSD-3-Clause
++ */
++
++#ifndef _DICE_LAYERING_CRYPTO_H_
++#define _DICE_LAYERING_CRYPTO_H_
++
++#include <psa/crypto.h>
++
++
++int derive_keypair_deterministic(void* seed, size_t seed_len, psa_key_id_t* key_id);
++
++int verify_derived_key_vs_cert(psa_key_id_t key_id,
++			      const uint8_t *cert_buf,
++			      size_t cert_buf_len);
++
++int verify_certificate_chain(const uint8_t *child_der, size_t child_len,
++                             const uint8_t *parent_der, size_t parent_len);
++
++int derive_seed(const void* input, size_t input_len, void* output, size_t* output_len);
++
++int generate_dice_certificate(psa_key_id_t subject_key_id,
++			      psa_key_id_t issuer_key_id,
++			      const char *subject_name,
++			      const char *issuer_name,
++			      uint8_t *out_der, size_t max_out_size,
++			      size_t *cert_len,
++			      uint8_t *rim, size_t rim_len);
++
++int sign_payload_deterministic_ecdsa(const uint8_t *priv_key, size_t priv_key_len,
++                                     const uint8_t *payload_hash, size_t hash_len,
++                                     uint8_t *signature, size_t signature_size,
++                                     size_t *signature_len);
++#endif /*_DICE_LAYERING_CRYPTO_H_*/
+diff --git a/app/dice_layering/rmm_stub/CMakeLists.txt b/app/dice_layering/rmm_stub/CMakeLists.txt
+new file mode 100644
+index 00000000..44852624
+--- /dev/null
++++ b/app/dice_layering/rmm_stub/CMakeLists.txt
+@@ -0,0 +1,28 @@
++#
++# SPDX-License-Identifier: BSD-3-Clause
++#
++
++add_library(rmm-app-dice-layering-stub)
++
++target_link_libraries(rmm-app-dice-layering-stub
++    rmm-el2-stub
++    rmm-lib-arch
++    rmm-lib-common
++    rmm-lib-debug
++    rmm-lib-rmm_el3_ifc
++    rmm-lib-simd
++    rmm-lib-smc
++)
++
++target_include_directories(rmm-app-dice-layering-stub
++    PUBLIC "include"
++    PRIVATE "../../common/include"
++            "${RMM_SOURCE_DIR}/app/attestation/rmm_stub/include"
++)
++
++target_sources(rmm-app-dice-layering-stub
++    PRIVATE "src/app_support/dice_layering_app.c"
++)
++
++list(APPEND RMM_EL2_STUB_LIBRARIES "rmm-app-dice-layering-stub")
++set(RMM_EL2_STUB_LIBRARIES ${RMM_EL2_STUB_LIBRARIES} PARENT_SCOPE)
+diff --git a/app/dice_layering/rmm_stub/include/dice_layering_app.h b/app/dice_layering/rmm_stub/include/dice_layering_app.h
+new file mode 100644
+index 00000000..82723bc7
+--- /dev/null
++++ b/app/dice_layering/rmm_stub/include/dice_layering_app.h
+@@ -0,0 +1,29 @@
++/*
++ * SPDX-License-Identifier: BSD-3-Clause
++ */
++
++#ifndef DICE_LAYERING_APP_H
++#define DICE_LAYERING_APP_H
++
++#include <app.h>
++#include <dice_layering_defs.h>
++#include <measurement.h>
++
++void dice_layering_app_init(void);
++
++struct app_data_cfg *dice_layering_app_get_data_cfg(void);
++
++int dice_layering_app_init_realm_identity(struct crypto_identity *dice_id,
++					  unsigned char *rim,
++					  unsigned char *rpv,
++					  enum hash_algo hash_alg);
++
++int dice_layering_app_sign_operation(unsigned long op,
++				     struct crypto_identity *dice_id,
++				     uint8_t *payload,
++				     size_t payload_len,
++				     uint8_t *out,
++				     size_t out_size,
++				     size_t *out_len);
++
++#endif /* DICE_LAYERING_APP_H */
+diff --git a/app/dice_layering/rmm_stub/include/dice_layering_defs.h b/app/dice_layering/rmm_stub/include/dice_layering_defs.h
+new file mode 100644
+index 00000000..38fc6089
+--- /dev/null
++++ b/app/dice_layering/rmm_stub/include/dice_layering_defs.h
+@@ -0,0 +1,58 @@
++/*
++ * SPDX-License-Identifier: BSD-3-Clause
++ */
++
++#ifndef DICE_LAYERING_DEFS_H
++#define DICE_LAYERING_DEFS_H
++
++#include <stddef.h>
++#include <stdint.h>
++#include <utils_def.h>
++
++#define DICE_LAYERING_APP_FUNC_ID_INIT			0x1U
++#define DICE_LAYERING_APP_FUNC_ID_REALM_INIT		0x2U
++#define DICE_LAYERING_APP_FUNC_ID_SIGN_DSRAK		0x3U
++#define DICE_LAYERING_APP_FUNC_ID_SIGN_DSRIK		0x4U
++
++#define DICE_LAYERING_APP_FUNC_ID_GET_CERT		0x5U
++
++#define CDI_LEN			U(32)
++#define TCI_LEN			U(32)
++#define SEC_KEY_LEN		U(32)
++#define SEED_LEN		(CDI_LEN + TCI_LEN)
++#define CERT_MAX_LEN		U(1024)
++
++/*
++ * Data structure with the DICE layering objects passed from TF-A BL31 to RMM.
++ * Must match struct dice_rmm_data in lib/rmm_el3_ifc/include/rmm_el3_ifc.h.
++ */
++struct dice_manifest_data {
++	uint8_t cdi_rmm[CDI_LEN];
++	uint8_t cert_dice_rak[CERT_MAX_LEN];
++	size_t cert_dice_rak_len;
++	uint8_t cert_tfa[CERT_MAX_LEN];
++	size_t cert_tfa_len;
++};
++
++/* Userspace export layout only; persistent certificates live in the manifest. */
++struct cert_chain {
++	uint8_t cert_dice_rak[CERT_MAX_LEN];
++	size_t cert_dice_rak_len;
++	uint8_t cert_tfa[CERT_MAX_LEN];
++	size_t cert_tfa_len;
++};
++
++/*
++ * Per-Realm cryptographic identity stored inside struct rd_aux.
++ */
++struct crypto_identity {
++	uint8_t cdi[CDI_LEN];
++	uint8_t dsrak[SEC_KEY_LEN];
++	uint8_t cert_dsrak[CERT_MAX_LEN];
++	size_t cert_dsrak_len;
++	uint8_t dsrik[SEC_KEY_LEN];
++	uint8_t cert_dsrik[CERT_MAX_LEN];
++	size_t cert_dsrik_len;
++};
++
++#endif /* DICE_LAYERING_DEFS_H */
+diff --git a/app/dice_layering/rmm_stub/src/app_support/dice_layering_app.c b/app/dice_layering/rmm_stub/src/app_support/dice_layering_app.c
+new file mode 100644
+index 00000000..f3e3a82c
+--- /dev/null
++++ b/app/dice_layering/rmm_stub/src/app_support/dice_layering_app.c
+@@ -0,0 +1,247 @@
++/*
++ * SPDX-License-Identifier: BSD-3-Clause
++ */
++
++#include <app_common.h>
++#include <assert.h>
++#include <cpuid.h>
++#include <debug.h>
++#include <dice_layering_app.h>
++#include <dice_layering_defs.h>
++#include <errno.h>
++#include <limits.h>
++#include <rmm_el3_ifc.h>
++#include <simd.h>
++#include <string.h>
++
++#define DICE_LAYERING_APP_PAGE_COUNT	11U
++
++static unsigned char rmm_dice_layering_app_pages
++	[MAX_CPUS][DICE_LAYERING_APP_PAGE_COUNT][GRANULE_SIZE] __aligned(GRANULE_SIZE);
++static struct app_data_cfg rmm_dice_layering_app_datas[MAX_CPUS] __aligned(GRANULE_SIZE);
++static bool dice_layering_app_init_done[MAX_CPUS];
++
++COMPILER_ASSERT(sizeof(struct dice_rmm_data) ==
++		sizeof(struct dice_manifest_data));
++COMPILER_ASSERT(sizeof(struct dice_rmm_data) <= GRANULE_SIZE);
++
++static int dice_layering_app_init_data(
++	struct app_data_cfg *app_data,
++	uintptr_t granule_pas[],
++	size_t granule_pa_count,
++	void *granule_va_start)
++{
++	assert(!dice_layering_app_init_done[my_cpuid()]);
++
++	return app_new_instance(app_data,
++				DICE_LAYERING_APP_ID,
++				granule_pas,
++				granule_pa_count,
++				granule_va_start,
++				APP_INSTANCE_FLAG_PERSISTENT);
++}
++
++static int dice_layering_app_init_crypto(struct app_data_cfg *app_data)
++{
++	unsigned long ret;
++	const struct dice_rmm_data *dice_data;
++
++	assert(!dice_layering_app_init_done[my_cpuid()]);
++
++	dice_data = rmm_el3_ifc_get_dice_data();
++	if (dice_data == NULL) {
++		ERROR("DICE: No DICE data found in boot manifest\n");
++		return -EINVAL;
++	}
++
++	app_map_shared_page(app_data);
++	assert(app_data->el2_shared_page != NULL);
++	(void)memcpy(app_data->el2_shared_page, dice_data,
++		     sizeof(struct dice_rmm_data));
++	app_unmap_shared_page(app_data);
++
++	SIMD_FPU_ALLOW(
++		ret = app_run(app_data, DICE_LAYERING_APP_FUNC_ID_INIT,
++			      0UL, 0UL, 0UL, 0UL));
++
++	assert(app_data->exit_flag != APP_EXIT_SVC_YIELD_FLAG);
++
++	if (ret > (unsigned long)INT_MAX) {
++		return -EINVAL;
++	}
++	return (int)ret;
++}
++
++void dice_layering_app_get_bss(uintptr_t *bss_pa, size_t *bss_size);
++
++void dice_layering_app_get_bss(uintptr_t *bss_pa, size_t *bss_size)
++{
++	static char dice_layering_app_bss[4U * GRANULE_SIZE] __aligned(GRANULE_SIZE);
++
++	*bss_pa = (uintptr_t)dice_layering_app_bss;
++	*bss_size = sizeof(dice_layering_app_bss);
++}
++
++void dice_layering_app_init(void)
++{
++	unsigned int cpuid = my_cpuid();
++	uintptr_t granule_pas[DICE_LAYERING_APP_PAGE_COUNT];
++	int ret;
++
++	if (dice_layering_app_init_done[cpuid]) {
++		return;
++	}
++
++	for (size_t i = 0U; i < DICE_LAYERING_APP_PAGE_COUNT; ++i) {
++		granule_pas[i] =
++			(uintptr_t)&rmm_dice_layering_app_pages[cpuid][i][0];
++	}
++
++	ret = dice_layering_app_init_data(
++		&rmm_dice_layering_app_datas[cpuid],
++		granule_pas,
++		DICE_LAYERING_APP_PAGE_COUNT,
++		&rmm_dice_layering_app_pages[cpuid][0][0]);
++	if (ret != 0) {
++		ERROR("DICE: Failed to initialize app instance on CPU %u\n", cpuid);
++		return;
++	}
++
++	ret = dice_layering_app_init_crypto(&rmm_dice_layering_app_datas[cpuid]);
++	if (ret != 0) {
++		ERROR("DICE: Failed to initialize DICE crypto on CPU %u (%d)\n",
++		      cpuid, ret);
++		return;
++	}
++
++	INFO("DICE: Layering app initialized and verified on CPU %u\n", cpuid);
++	dice_layering_app_init_done[cpuid] = true;
++}
++
++struct app_data_cfg *dice_layering_app_get_data_cfg(void)
++{
++	unsigned int cpuid = my_cpuid();
++
++	assert(dice_layering_app_init_done[cpuid]);
++	return &rmm_dice_layering_app_datas[cpuid];
++}
++
++int dice_layering_app_init_realm_identity(struct crypto_identity *dice_id,
++					  unsigned char *rim,
++					  unsigned char *rpv,
++					  enum hash_algo hash_alg)
++{
++	unsigned long ret;
++	struct app_data_cfg *app_data;
++	size_t copied = 0U;
++	size_t chunk_size;
++
++	assert(dice_layering_app_init_done[my_cpuid()]);
++
++	app_data = dice_layering_app_get_data_cfg();
++
++	app_map_shared_page(app_data);
++	assert(app_data->el2_shared_page != NULL);
++	(void)memcpy(app_data->el2_shared_page, rim, MAX_MEASUREMENT_SIZE);
++	(void)memcpy((uint8_t *)app_data->el2_shared_page + MAX_MEASUREMENT_SIZE,
++		     rpv, RPV_SIZE);
++	app_unmap_shared_page(app_data);
++
++	SIMD_FPU_ALLOW(
++		ret = app_run(app_data, DICE_LAYERING_APP_FUNC_ID_REALM_INIT,
++			      (unsigned long)hash_alg, 0UL, 0UL, 0UL));
++
++	while (app_data->exit_flag == APP_EXIT_SVC_YIELD_FLAG) {
++		if (copied >= sizeof(struct crypto_identity)) {
++			return -EINVAL;
++		}
++
++		chunk_size = sizeof(struct crypto_identity) - copied;
++		if (chunk_size > GRANULE_SIZE) {
++			chunk_size = GRANULE_SIZE;
++		}
++
++		app_map_shared_page(app_data);
++		assert(app_data->el2_shared_page != NULL);
++		(void)memcpy((uint8_t *)dice_id + copied,
++			     app_data->el2_shared_page, chunk_size);
++		(void)memset(app_data->el2_shared_page, 0, chunk_size);
++		app_unmap_shared_page(app_data);
++
++		copied += chunk_size;
++
++		SIMD_FPU_ALLOW(ret = app_resume(app_data));
++	}
++
++	if (ret > (unsigned long)INT_MAX) {
++		return -EINVAL;
++	}
++	return (int)ret;
++}
++
++int dice_layering_app_sign_operation(unsigned long op,
++				     struct crypto_identity *dice_id,
++				     uint8_t *payload,
++				     size_t payload_len,
++				     uint8_t *out,
++				     size_t out_size,
++				     size_t *out_len)
++{
++	unsigned long ret;
++	struct app_data_cfg *app_data;
++	uint8_t *key;
++	size_t key_len;
++
++	if (op == DICE_LAYERING_APP_FUNC_ID_SIGN_DSRAK) {
++		key = dice_id->dsrak;
++		key_len = sizeof(dice_id->dsrak);
++	} else if (op == DICE_LAYERING_APP_FUNC_ID_SIGN_DSRIK) {
++		key = dice_id->dsrik;
++		key_len = sizeof(dice_id->dsrik);
++	} else {
++		return -EINVAL;
++	}
++
++	if ((key_len + payload_len) > GRANULE_SIZE) {
++		return -EINVAL;
++	}
++
++	assert(dice_layering_app_init_done[my_cpuid()]);
++	app_data = dice_layering_app_get_data_cfg();
++
++	app_map_shared_page(app_data);
++	assert(app_data->el2_shared_page != NULL);
++	(void)memcpy(app_data->el2_shared_page, key, key_len);
++	(void)memcpy((uint8_t *)app_data->el2_shared_page + key_len,
++		     payload, payload_len);
++	app_unmap_shared_page(app_data);
++
++	SIMD_FPU_ALLOW(
++		ret = app_run(app_data, op, key_len, payload_len, out_size, 0UL));
++
++	assert(app_data->exit_flag != APP_EXIT_SVC_YIELD_FLAG);
++
++	if (ret != 0UL) {
++		app_map_shared_page(app_data);
++		if (app_data->el2_shared_page != NULL) {
++			(void)memset(app_data->el2_shared_page, 0, GRANULE_SIZE);
++		}
++		app_unmap_shared_page(app_data);
++		return -EINVAL;
++	}
++
++	app_map_shared_page(app_data);
++	assert(app_data->el2_shared_page != NULL);
++	(void)memcpy(out_len, app_data->el2_shared_page, sizeof(size_t));
++	if (*out_len > out_size) {
++		(void)memset(app_data->el2_shared_page, 0, GRANULE_SIZE);
++		app_unmap_shared_page(app_data);
++		return -EINVAL;
++	}
++	(void)memcpy(out, (uint8_t *)app_data->el2_shared_page + sizeof(size_t),
++		     *out_len);
++	(void)memset(app_data->el2_shared_page, 0, GRANULE_SIZE);
++	app_unmap_shared_page(app_data);
++
++	return 0;
++}
+diff --git a/lib/rmm_el3_ifc/include/rmm_el3_ifc.h b/lib/rmm_el3_ifc/include/rmm_el3_ifc.h
+index b836fd7c..39adf016 100644
+--- a/lib/rmm_el3_ifc/include/rmm_el3_ifc.h
++++ b/lib/rmm_el3_ifc/include/rmm_el3_ifc.h
+@@ -499,11 +499,29 @@ COMPILER_ASSERT_NO_CBMC(U(offsetof(struct rmm_core_manifest, plat_coh_region)) =
+ COMPILER_ASSERT_NO_CBMC(U(offsetof(struct rmm_core_manifest, plat_smmu)) == 112U);
+ COMPILER_ASSERT_NO_CBMC(U(offsetof(struct rmm_core_manifest, plat_root_complex)) == 136U);
+ 
++/* DICE Layering structures passed via manifest->plat_data */
++#define DICE_CDI_LEN			32U
++#define DICE_MAX_CERT_LEN		1024U
++
++struct dice_rmm_data {
++	uint8_t cdi_rmm[DICE_CDI_LEN];
++	uint8_t cert_dice_rak[DICE_MAX_CERT_LEN];
++	size_t cert_dice_rak_len;
++	uint8_t cert_tfa[DICE_MAX_CERT_LEN];
++	size_t cert_tfa_len;
++};
++
+ /*
+  * Accessors to the Boot Manifest data
+  */
+ unsigned int rmm_el3_ifc_get_manifest_version(void);
+ 
++/*
++ * Return a pointer to the cached DICE layering data passed by EL3 Firmware,
++ * or NULL if not provided.
++ */
++const struct dice_rmm_data *rmm_el3_ifc_get_dice_data(void);
++
+ /*
+  * These functions must be called only after the core manifest has
+  * been processed (See rmm_el3_ifc_process_boot_manifest()). Also, since
+diff --git a/lib/rmm_el3_ifc/src/rmm_el3_ifc_manifest.c b/lib/rmm_el3_ifc/src/rmm_el3_ifc_manifest.c
+index a5e653d6..ff40e999 100644
+--- a/lib/rmm_el3_ifc/src/rmm_el3_ifc_manifest.c
++++ b/lib/rmm_el3_ifc/src/rmm_el3_ifc_manifest.c
+@@ -253,6 +253,37 @@ static size_t copy_root_complex_data(size_t offset)
+ 	return (offset + size);
+ }
+ 
++/*
++ * Copy the DICE layering data passed via plat_data into the cached manifest buffer.
++ *
++ * Return updated offset.
++ */
++static size_t copy_dice_data(size_t offset)
++{
++	uintptr_t plat_data = local_core_manifest->plat_data;
++	struct dice_rmm_data *cached_dice;
++	size_t size = sizeof(struct dice_rmm_data);
++
++	if (plat_data == 0UL) {
++		return offset;
++	}
++
++	offset = round_up(offset, sizeof(uint64_t));
++
++	/* Ensure DICE data fits in the cached manifest buffer */
++	assert((offset + size) <= GRANULE_SIZE);
++
++	cached_dice = (struct dice_rmm_data *)((uintptr_t)cached_manifest + offset);
++
++	(void)memcpy((void *)cached_dice, (const void *)plat_data, size);
++
++	local_core_manifest->plat_data = (uintptr_t)cached_dice;
++
++	inv_dcache_range((uintptr_t)cached_dice, size);
++
++	return (offset + size);
++}
++
+ void rmm_el3_ifc_process_boot_manifest(void)
+ {
+ 	struct rmm_core_manifest *core_manifest;
+@@ -305,9 +336,12 @@ void rmm_el3_ifc_process_boot_manifest(void)
+ 		offset = copy_smmu_data(offset);
+ 
+ 		/* Copy the PCIe Root Complex data into the cached manifest buffer */
+-		(void)copy_root_complex_data(offset);
++		offset = copy_root_complex_data(offset);
+ 	}
+ 
++	/* Copy the DICE layering data if provided by EL3 */
++	(void)copy_dice_data(offset);
++
+ 	/*
+ 	 * Invalidate the cache for the manifest header to ensure visibility of the
+ 	 * data copied by memcpy() and any updates performed by copy_xxx_data().
+@@ -316,6 +350,14 @@ void rmm_el3_ifc_process_boot_manifest(void)
+ 				sizeof(struct rmm_core_manifest));
+ }
+ 
++/* Return a pointer to the cached DICE layering data */
++const struct dice_rmm_data *rmm_el3_ifc_get_dice_data(void)
++{
++	assert(local_core_manifest != NULL);
++
++	return (const struct dice_rmm_data *)local_core_manifest->plat_data;
++}
++
+ /* Return the raw value of the received boot manifest */
+ unsigned int rmm_el3_ifc_get_manifest_version(void)
+ {
+diff --git a/lib/smc/include/smc-rsi.h b/lib/smc/include/smc-rsi.h
+index 3c5b738a..eaea2d01 100644
+--- a/lib/smc/include/smc-rsi.h
++++ b/lib/smc/include/smc-rsi.h
+@@ -329,6 +329,25 @@
+  */
+ #define SMC_RSI_PLANE_SYSREG_WRITE	SMC64_RSI_FID(U(0x1F))
+ 
++/*
++ * FID: 0xC40001B0
++ *
++ * Perform DICE cryptographic operations (Sign or Export Certificates).
++ * arg1 == Operation ID (RSI_DICE_OP_*)
++ * arg2 == IPA of the shared 4KB Realm granule
++ * arg3 == Input payload length (for SIGN operations)
++ * arg4 == Output buffer size
++ * ret0 == Status / error
++ * ret1 == Actual output size written to the shared buffer
++ */
++#define SMC_RSI_DICE_CRYPTO		SMC64_RSI_FID(U(0x20))
++
++#define RSI_DICE_OP_SIGN_DSRAK		U(0)
++#define RSI_DICE_OP_SIGN_DSRIK		U(1)
++#define RSI_DICE_OP_CERT_DSRAK		U(2)
++#define RSI_DICE_OP_CERT_DSRIK		U(3)
++#define RSI_DICE_OP_CERT_CHAIN		U(4)
++
+ /*
+  * TODO: Currently RMM do not have support to enable RSI commands above FID
+  * 0xC40001AF as this conflicts with RMM EL3 interface FIDs. Once RMM needs to
+diff --git a/runtime/CMakeLists.txt b/runtime/CMakeLists.txt
+index 0fe539da..4f7e63aa 100644
+--- a/runtime/CMakeLists.txt
++++ b/runtime/CMakeLists.txt
+@@ -146,6 +146,7 @@ target_sources(rmm-runtime
+             "rsi/psci.c"
+             "rsi/realm_ipa_helper.c"
+             "rsi/realm_attest.c"
++            "rsi/realm_dice_operations.c"
+             "rsi/vdev.c"
+             "rsi/version.c")
+ 
+diff --git a/runtime/core/exit.c b/runtime/core/exit.c
+index 7d6292b6..1bc00976 100644
+--- a/runtime/core/exit.c
++++ b/runtime/core/exit.c
+@@ -567,7 +567,8 @@ static inline bool rsi_handler_needs_fpu(unsigned int id)
+ {
+ #ifdef RMM_FPU_USE_AT_REL2
+ 	if ((id == SMC_RSI_ATTEST_TOKEN_CONTINUE) ||
+-	    (id == SMC_RSI_MEASUREMENT_EXTEND)) {
++	    (id == SMC_RSI_MEASUREMENT_EXTEND) ||
++	    (id == SMC_RSI_DICE_CRYPTO)) {
+ 		return true;
+ 	}
+ #else
+@@ -790,6 +791,9 @@ static bool handle_realm_rsi(struct rec *rec, struct rmi_rec_exit *rec_exit)
+ 	case SMC_RSI_VDEV_VALIDATE_MAPPING:
+ 		handle_rsi_vdev_validate_mapping(rec, rec_exit, &res);
+ 		break;
++	case SMC_RSI_DICE_CRYPTO:
++		handle_rsi_dice_crypto(rec, &res);
++		break;
+ 	default:
+ 		res.action = UPDATE_REC_RETURN_TO_REALM;
+ 		res.smc_res.x[0] = SMC_UNKNOWN;
+@@ -812,11 +816,12 @@ static bool handle_realm_rsi(struct rec *rec, struct rmi_rec_exit *rec_exit)
+ 			 * Emulate the data abort against that IPA so that the
+ 			 * host can bring the page in.
+ 			 *
+-			 * All RSI calls except SMC_RSI_PLANE_ENTER hold the
+-			 * IPA in X1.
++			 * All RSI calls except SMC_RSI_PLANE_ENTER and
++			 * SMC_RSI_DICE_CRYPTO hold the IPA in X1.
+ 			 */
+ 			unsigned int ipa_reg =
+-				(function_id == SMC_RSI_PLANE_ENTER) ? 2U : 1U;
++				((function_id == SMC_RSI_PLANE_ENTER) ||
++				 (function_id == SMC_RSI_DICE_CRYPTO)) ? 2U : 1U;
+ 			unsigned long ipa = plane->regs[ipa_reg];
+ 
+ 			emulate_stage2_data_abort(rec_exit, res.rtt_level, ipa);
+diff --git a/runtime/core/handler.c b/runtime/core/handler.c
+index 9c2ab900..0f1126e2 100644
+--- a/runtime/core/handler.c
++++ b/runtime/core/handler.c
+@@ -182,7 +182,8 @@ COMPILER_ASSERT(ARRAY_SIZE(smc_handlers) == SMC64_NUM_FIDS_IN_RANGE(RMI));
+ static inline bool rmi_handler_needs_fpu(unsigned int id)
+ {
+ #ifdef RMM_FPU_USE_AT_REL2
+-	if ((id == SMC_RMI_REALM_CREATE) || (id == SMC_RMI_RTT_DATA_MAP_INIT) ||
++	if ((id == SMC_RMI_REALM_CREATE) || (id == SMC_RMI_REALM_ACTIVATE) ||
++	    (id == SMC_RMI_RTT_DATA_MAP_INIT) ||
+ 	    (id == SMC_RMI_REC_CREATE) || (id == SMC_RMI_RTT_INIT_RIPAS) ||
+ 	    (id == SMC_RMI_OP_CONTINUE) ||
+ 	    (id == SMC_RMI_PDEV_COMMUNICATE) ||
+diff --git a/runtime/core/init.c b/runtime/core/init.c
+index 5d0b7a95..3d64111e 100644
+--- a/runtime/core/init.c
++++ b/runtime/core/init.c
+@@ -12,6 +12,7 @@
+ #include <buffer.h>
+ #include <debug.h>
+ #include <dev_granule.h>
++#include <dice_layering_app.h>
+ #include <feature.h>
+ #include <firme.h>
+ #include <glob_data.h>
+@@ -114,12 +115,13 @@ uint64_t rmm_warmboot_main(void)
+ 	slot_buf_finish_warmboot_init();
+ 
+ 	/*
+-	 * Random app init
++	 * Random and DICE Layering app init
+ 	 */
+ #ifdef RMM_FPU_USE_AT_REL2
+ 	simd_context_save(get_cpu_ns_simd_context());
+ #endif
+ 	random_app_init_prng();
++	dice_layering_app_init();
+ #ifdef RMM_FPU_USE_AT_REL2
+ 	simd_context_restore(get_cpu_ns_simd_context());
+ #endif
+@@ -180,6 +182,17 @@ uint64_t rmm_main(void)
+ 		RMM_EL3_MANIFEST_GET_VERS_MAJOR(manifest_version),
+ 		RMM_EL3_MANIFEST_GET_VERS_MINOR(manifest_version));
+ 
++
++	const struct dice_rmm_data *dice_data = rmm_el3_ifc_get_dice_data();
++
++	if (dice_data != NULL) {
++		NOTICE("DICE: Received cdi_rmm (%zuB), cert_dice_rak (%zuB), cert_tfa (%zuB)\n",
++		       sizeof(dice_data->cdi_rmm),
++		       dice_data->cert_dice_rak_len,
++		       dice_data->cert_tfa_len);
++	}
++
++
+ 	/* Report higher supported RMI revision */
+ 	NOTICE("RMI ABI revision v%lu.%lu\n",
+ 	       RMI_ABI_VERSION_GET_MAJOR(rmi_revision),
+@@ -270,6 +283,8 @@ uint64_t rmm_main(void)
+ 		WARN("Attestation init failed.\n");
+ 	}
+ 
++	dice_layering_app_init();
++
+ #ifdef RMM_FPU_USE_AT_REL2
+ 	/*
+ 	 * TODO: Do not save and restore NS state. Instead after
+diff --git a/runtime/include/realm.h b/runtime/include/realm.h
+index f0a69a80..2b58f498 100644
+--- a/runtime/include/realm.h
++++ b/runtime/include/realm.h
+@@ -9,6 +9,7 @@
+ #include <assert.h>
+ #include <atomics.h>
+ #include <dev.h>
++#include <dice_layering_defs.h>
+ #include <granule.h>
+ #include <measurement.h>
+ #include <memory.h>
+@@ -44,6 +45,9 @@ struct rd_aux {
+ 	struct vdev_map vdev_map_mem[RD_MAX_VDEVS(MAX_VDEVS_ORDER_PER_RD)];
+ 
+ 	struct mpidr_rec_map mpidr_rec_map;
++
++	/* Realm-only DICE identity (CDI, DSRAK/DSRIK, and leaf certificates). */
++	struct crypto_identity crypto_data;
+ };
+ 
+ COMPILER_ASSERT(MAX_RD_AUX_GRANULES >=
+diff --git a/runtime/include/rsi-handler.h b/runtime/include/rsi-handler.h
+index 93894cb9..64640969 100644
+--- a/runtime/include/rsi-handler.h
++++ b/runtime/include/rsi-handler.h
+@@ -125,4 +125,5 @@ void handle_rsi_vdev_get_info(struct rec *rec,
+ void handle_rsi_vdev_validate_mapping(struct rec *rec,
+ 				      struct rmi_rec_exit *rec_exit,
+ 				      struct rsi_result *res);
++void handle_rsi_dice_crypto(struct rec *rec, struct rsi_result *res);
+ #endif /* RSI_HANDLER_H */
+diff --git a/runtime/rmi/realm.c b/runtime/rmi/realm.c
+index 91638560..417f645b 100644
+--- a/runtime/rmi/realm.c
++++ b/runtime/rmi/realm.c
+@@ -7,6 +7,7 @@
+ #include <assert.h>
+ #include <buffer.h>
+ #include <debug.h>
++#include <dice_layering_app.h>
+ #include <feature.h>
+ #include <granule.h>
+ #include <measurement.h>
+@@ -53,6 +54,23 @@ void smc_realm_activate(unsigned long rd_addr, struct smc_result *res)
+ 	assert(rd != NULL);
+ 
+ 	if (get_rd_state_locked(rd) == REALM_NEW) {
++		struct rd_aux *rd_aux = buffer_rd_aux_granules_map(
++			&rd->aux_granules[0], rd->num_rd_aux);
++
++		assert(rd_aux != NULL);
++		if (dice_layering_app_init_realm_identity(
++				&rd_aux->crypto_data,
++				rd->measurement[RIM_MEASUREMENT_SLOT],
++				rd->rpv,
++				rd->algorithm) != 0) {
++			buffer_rd_aux_granules_unmap(rd_aux, rd->num_rd_aux);
++			buffer_unmap(rd);
++			granule_unlock(g_rd);
++			res->x[0] = RMI_ERROR_REALM;
++			return;
++		}
++		buffer_rd_aux_granules_unmap(rd_aux, rd->num_rd_aux);
++
+ 		set_rd_state(rd, REALM_ACTIVE);
+ 		ret = RMI_SUCCESS;
+ 	} else {
+@@ -662,6 +680,9 @@ static void realm_destroy_cleanup(struct rd *rd, struct rd_aux *rd_aux)
+ 	assert(sarray_num_elems(&rd_aux->mpidr_rec_map.rec_map_hnd) == 0U);
+ 	sarray_destroy(&rd_aux->mpidr_rec_map.rec_map_hnd);
+ 
++	/* Scrub Realm DICE identity keys and CDI upon Realm destruction */
++	(void)memset(&rd_aux->crypto_data, 0, sizeof(rd_aux->crypto_data));
++
+ 	/* Free root tables in all RTT trees */
+ 	for (unsigned int i = 0U; i < realm_num_s2_rtts(rd); i++) {
+ 		struct s2tt_context *s2tt_ctx = &rd->s2_ctx[i];
+diff --git a/runtime/rsi/logger.c b/runtime/rsi/logger.c
+index 92bb73b7..a32a9125 100644
+--- a/runtime/rsi/logger.c
++++ b/runtime/rsi/logger.c
+@@ -61,7 +61,8 @@ static const struct rsi_handler rsi_logger[] = {
+ 	RSI_FUNCTION(_PLANE_ENTER, 2U, 0U),		/* 0xC40001A3 */
+ 	RSI_FUNCTION(_VDEV_DMA_DISABLE, 1U, 0U),	/* 0xC40001A4 */
+ 	RSI_FUNCTION(_PLANE_SYSREG_READ, 2U, 1U),	/* 0xC40001AE */
+-	RSI_FUNCTION(_PLANE_SYSREG_WRITE, 3U, 0U)	/* 0xC40001AF */
++	RSI_FUNCTION(_PLANE_SYSREG_WRITE, 3U, 0U),	/* 0xC40001AF */
++	RSI_FUNCTION(_DICE_CRYPTO, 4U, 1U)		/* 0xC40001B0 */
+ };
+ 
+ #define RSI_STATUS_STRING(_id)[RSI_##_id] = #_id
+@@ -92,7 +93,7 @@ static size_t print_entry(unsigned int id, unsigned long args[],
+ 	switch (id) {
+ 	case SMC_RSI_VERSION ... SMC_RSI_PLANE_ENTER:
+ 		FALLTHROUGH;
+-	case SMC_RSI_PLANE_SYSREG_READ ... SMC_RSI_PLANE_SYSREG_WRITE: {
++	case SMC_RSI_PLANE_SYSREG_READ ... SMC_RSI_DICE_CRYPTO: {
+ 		const struct rsi_handler *logger = fid_to_rsi_logger(id);
+ 
+ 		num = logger->num_args;
+@@ -177,7 +178,7 @@ void rsi_log_on_exit(unsigned int function_id, unsigned long args[],
+ 	switch (function_id) {
+ 	case SMC_RSI_VERSION ... SMC_RSI_PLANE_ENTER:
+ 		FALLTHROUGH;
+-	case SMC_RSI_PLANE_SYSREG_READ ... SMC_RSI_PLANE_SYSREG_WRITE: {
++	case SMC_RSI_PLANE_SYSREG_READ ... SMC_RSI_DICE_CRYPTO: {
+ 		const struct rsi_handler *logger =
+ 				fid_to_rsi_logger(function_id);
+ 
+diff --git a/runtime/rsi/realm_dice_operations.c b/runtime/rsi/realm_dice_operations.c
+new file mode 100644
+index 00000000..a9a0767c
+--- /dev/null
++++ b/runtime/rsi/realm_dice_operations.c
+@@ -0,0 +1,164 @@
++/*
++ * SPDX-License-Identifier: BSD-3-Clause
++ * SPDX-FileCopyrightText: Copyright TF-RMM Contributors.
++ */
++
++#include <buffer.h>
++#include <debug.h>
++#include <dice_layering_app.h>
++#include <granule.h>
++#include <realm.h>
++#include <rmm_el3_ifc.h>
++#include <rsi-handler.h>
++#include <smc-rsi.h>
++#include <string.h>
++
++#define MAX_DICE_PAYLOAD_LEN	(GRANULE_SIZE - SEC_KEY_LEN)
++
++COMPILER_ASSERT(sizeof(struct cert_chain) <= GRANULE_SIZE);
++
++void handle_rsi_dice_crypto(struct rec *rec, struct rsi_result *res)
++{
++	struct rec_plane *plane;
++	unsigned long op_id;
++	unsigned long shared_ipa;
++	unsigned long input_len;
++	unsigned long out_size;
++	struct granule *llt = NULL;
++	void *shared_va = NULL;
++	struct rd *rd = NULL;
++	struct rd_aux *rd_aux = NULL;
++	struct crypto_identity *dice_id;
++	size_t actual_out_size = 0UL;
++	int crypto_ret;
++
++	assert(rec != NULL);
++
++	/* RSI calls can only be issued by Plane 0 */
++	plane = rec_plane_0(rec);
++	assert(rec_is_plane_0_active(rec));
++
++	op_id = plane->regs[1];
++	shared_ipa = plane->regs[2];
++	input_len = plane->regs[3];
++	out_size = plane->regs[4];
++
++	res->action = UPDATE_REC_RETURN_TO_REALM;
++
++	if (!GRANULE_ALIGNED(shared_ipa) || !addr_in_rec_par(rec, shared_ipa)) {
++		res->smc_res.x[0] = RSI_ERROR_INPUT;
++		return;
++	}
++
++	if (!realm_mem_lock_map(rec, shared_ipa, &shared_va, &llt, res)) {
++		/* In case of failure res is updated */
++		return;
++	}
++
++	assert((shared_va != NULL) && (llt != NULL));
++
++	if (op_id == RSI_DICE_OP_CERT_CHAIN) {
++		const struct dice_rmm_data *parents = rmm_el3_ifc_get_dice_data();
++		struct cert_chain *chain = shared_va;
++
++		/* One immutable machine-wide copy; no RD/AUX mapping is needed. */
++		if ((parents == NULL) || (out_size < sizeof(*chain)) ||
++		    (parents->cert_dice_rak_len == 0U) ||
++		    (parents->cert_dice_rak_len > sizeof(chain->cert_dice_rak)) ||
++		    (parents->cert_tfa_len == 0U) ||
++		    (parents->cert_tfa_len > sizeof(chain->cert_tfa))) {
++			res->smc_res.x[0] = RSI_ERROR_INPUT;
++			goto out_shared;
++		}
++
++		/* Export only public certificates and zero all unused ABI padding. */
++		(void)memset(chain, 0, sizeof(*chain));
++		(void)memcpy(chain->cert_dice_rak, parents->cert_dice_rak,
++			     parents->cert_dice_rak_len);
++		chain->cert_dice_rak_len = parents->cert_dice_rak_len;
++		(void)memcpy(chain->cert_tfa, parents->cert_tfa,
++			     parents->cert_tfa_len);
++		chain->cert_tfa_len = parents->cert_tfa_len;
++		res->smc_res.x[0] = RSI_SUCCESS;
++		res->smc_res.x[1] = sizeof(*chain);
++		goto out_shared;
++	}
++
++	/*
++	 * Map RD and RD_AUX granules. The Realm's DICE identity is initialized
++	 * once at RMI_REALM_ACTIVATE and remains read-only while RECs run.
++	 */
++	rd = buffer_granule_map(rec->realm_info.g_rd, SLOT_RD);
++	assert(rd != NULL);
++
++	rd_aux = buffer_rd_aux_granules_map(&rd->aux_granules[0], rd->num_rd_aux);
++	assert(rd_aux != NULL);
++
++	dice_id = &rd_aux->crypto_data;
++
++	switch (op_id) {
++	case RSI_DICE_OP_SIGN_DSRAK:
++	case RSI_DICE_OP_SIGN_DSRIK: {
++		unsigned long app_op;
++
++		if ((input_len == 0UL) || (input_len > MAX_DICE_PAYLOAD_LEN) ||
++		    (out_size == 0UL) || (out_size > GRANULE_SIZE)) {
++			res->smc_res.x[0] = RSI_ERROR_INPUT;
++			goto out_unmap;
++		}
++
++		app_op = (op_id == RSI_DICE_OP_SIGN_DSRAK) ?
++			 DICE_LAYERING_APP_FUNC_ID_SIGN_DSRAK :
++			 DICE_LAYERING_APP_FUNC_ID_SIGN_DSRIK;
++
++		crypto_ret = dice_layering_app_sign_operation(
++			app_op, dice_id,
++			(uint8_t *)shared_va, input_len,
++			(uint8_t *)shared_va, out_size, &actual_out_size);
++		if (crypto_ret != 0) {
++			res->smc_res.x[0] = RSI_ERROR_INPUT;
++			goto out_unmap;
++		}
++
++		res->smc_res.x[0] = RSI_SUCCESS;
++		res->smc_res.x[1] = actual_out_size;
++		break;
++	}
++
++	case RSI_DICE_OP_CERT_DSRAK:
++	case RSI_DICE_OP_CERT_DSRIK: {
++		const uint8_t *cert_ptr;
++		size_t cert_len;
++
++		if (op_id == RSI_DICE_OP_CERT_DSRAK) {
++			cert_ptr = dice_id->cert_dsrak;
++			cert_len = dice_id->cert_dsrak_len;
++		} else {
++			cert_ptr = dice_id->cert_dsrik;
++			cert_len = dice_id->cert_dsrik_len;
++		}
++
++		if ((cert_len == 0UL) || (out_size < cert_len) ||
++		    (cert_len > GRANULE_SIZE)) {
++			res->smc_res.x[0] = RSI_ERROR_INPUT;
++			goto out_unmap;
++		}
++
++		(void)memcpy(shared_va, cert_ptr, cert_len);
++		res->smc_res.x[0] = RSI_SUCCESS;
++		res->smc_res.x[1] = cert_len;
++		break;
++	}
++
++	default:
++		res->smc_res.x[0] = RSI_ERROR_INPUT;
++		break;
++	}
++
++out_unmap:
++	buffer_rd_aux_granules_unmap(rd_aux, rd->num_rd_aux);
++	buffer_unmap(rd);
++out_shared:
++	buffer_unmap(shared_va);
++	granule_unlock(llt);
++}
+-- 
+2.56.0
+

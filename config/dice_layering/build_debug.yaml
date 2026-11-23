@@ -1,0 +1,40 @@
+
+# SPDX-License-Identifier: MIT
+%YAML 1.2
+---
+description: >-
+  Build TF-A and RMM debug firmware for the QEMU SBSA CCA stack.
+  Apply after qemu/cca.yaml and buildroot-cca.yaml. Remove this overlay
+  to restore the Release defaults. Use qemu-dbg.yaml separately at run time.
+
+# QEMU components replace the generic build entries during runner resolution,
+# so overrides must live under buildex.runners.QEMU.
+buildex:
+  runners:
+    QEMU:
+      tfa:
+        params:
+          DEBUG: 1
+          # Temporary workaround for the CPTR_EL3 feature-mask assertion.
+          # This disables all TF-A assertions, while retaining debug symbols.
+          ENABLE_ASSERTIONS: 0
+          ENABLE_LTO: 0
+          # TF-A appends CFLAGS after its default -Os; the last -O wins.
+          CFLAGS: "'-Og -fno-omit-frame-pointer'"
+        prebuild:
+          # TF-A does not track compiler-option changes in object dependencies.
+          # Clean the selected Debug build only when the parameter set changes.
+          - 'echo "${param:join_equal}" > ${param:builddir}/shrinkwrap-debug.params.new'
+          - if ! cmp -s "${param:builddir}/shrinkwrap-debug.params.new" "${param:builddir}/shrinkwrap-debug.params"; then
+          - '  make BUILD_BASE=${param:builddir} ${param:join_equal} clean'
+          - fi
+          - mv ${param:builddir}/shrinkwrap-debug.params.new ${param:builddir}/shrinkwrap-debug.params
+        artifacts:
+          BL1: ${param:builddir}/qemu_sbsa/debug/bl1.bin
+          FIP: ${param:builddir}/qemu_sbsa/debug/fip.bin
+
+      rmm:
+        params:
+          -DCMAKE_BUILD_TYPE: Debug
+        artifacts:
+          RMM: ${param:builddir}/Debug/rmm.img

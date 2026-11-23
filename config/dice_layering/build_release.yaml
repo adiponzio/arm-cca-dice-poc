@@ -1,0 +1,16 @@
+
+# Copyright (c) 2024, Linaro Limited.
+# SPDX-License-Identifier: MIT
+
+%YAML 1.2
+---
+description: >-
+  Since by default rmm is built in Debug, force the Release flag.
+buildex:
+  runners:
+    QEMU:
+      rmm:
+        params:
+          -DCMAKE_BUILD_TYPE: Release
+        artifacts:
+          RMM: ${param:builddir}/Release/rmm.img

@@ -1,0 +1,15 @@
+
+# Copyright (c) 2024, Linaro Limited.
+# SPDX-License-Identifier: MIT
+
+%YAML 1.2
+---
+description: >-
+  Enable the DICE Layering feature for Realm key provisioning.
+
+buildex:
+  runners:
+    QEMU:
+      tfa:
+        params:
+          DICE_LAYERING: 1
